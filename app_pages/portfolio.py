@@ -114,51 +114,86 @@ if "ticker" not in st.session_state:
 positions = load_portfolio()
 
 # ---------------------------------------------------------
-# PORTFOLIO SUMMARY KPIS
+# PORTFOLIO SUMMARY KPIS (CC & CSP UNIFIED)
 # ---------------------------------------------------------
-total_cost = sum(p["shares"] * p["cost_basis"] for p in positions)
-total_value = 0.0
+live_quotes = {}
+total_stock_cost = 0.0
+total_stock_value = 0.0
+total_stock_pnl = 0.0
+
+total_csp_collateral = 0.0
+total_csp_pnl = 0.0
+
 total_active_cc_premium = 0.0
 total_active_csp_premium = 0.0
-live_quotes = {}
 
 for p in positions:
     t = p["ticker"]
+    shs = p.get("shares", 0)
+    cost = p.get("cost_basis", 0.0)
+
     if t not in live_quotes:
         price, chg = fetch_current_quote(t)
-        live_quotes[t] = price if price is not None else p["cost_basis"]
+        live_quotes[t] = price if price is not None else cost
     cur_p = live_quotes[t]
-    total_value += p["shares"] * cur_p
 
     cc = p.get("covered_call", {})
-    if cc and cc.get("active"):
+    csp = p.get("cash_secured_put", {})
+    has_cc = bool(cc and cc.get("active"))
+    has_csp = bool(csp and csp.get("active"))
+    is_pure_csp = has_csp and not has_cc and ("cash secured put" in p.get("notes", "").lower() or not has_cc)
+
+    # 1. Stock & Covered Call metrics
+    if not is_pure_csp:
+        s_cost = shs * cost
+        s_val = shs * cur_p
+        total_stock_cost += s_cost
+        total_stock_value += s_val
+        total_stock_pnl += (s_val - s_cost)
+
+    if has_cc:
         total_active_cc_premium += float(cc.get("premium", 0.0)) * 100 * int(cc.get("contracts", 1))
 
-    csp = p.get("cash_secured_put", {})
-    if csp and csp.get("active"):
-        total_active_csp_premium += float(csp.get("premium", 0.0)) * 100 * int(csp.get("contracts", 1))
+    # 2. Cash Secured Put metrics
+    if has_csp:
+        c_cnt = int(csp.get("contracts", 1))
+        c_strike = float(csp.get("strike", cost))
+        c_prem = float(csp.get("premium", 0.0))
+        collateral = c_strike * 100 * c_cnt
+        income = c_prem * 100 * c_cnt
 
-total_pnl = total_value - total_cost
-total_pnl_pct = (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
-total_cc_contracts = sum(p["shares"] // 100 for p in positions)
-pnl_color = "#00875A" if total_pnl >= 0 else "#e5443b"
+        total_csp_collateral += collateral
+        total_active_csp_premium += income
+
+        if cur_p >= c_strike:
+            c_pnl = income
+        else:
+            intrinsic_loss = (c_strike - cur_p) * 100 * c_cnt
+            c_pnl = income - intrinsic_loss
+        total_csp_pnl += c_pnl
+
+total_portfolio_cost = total_stock_cost + total_csp_collateral
+total_portfolio_value = total_stock_value + total_csp_collateral
+total_combined_pnl = total_stock_pnl + total_csp_pnl
+total_pnl_pct = (total_combined_pnl / total_portfolio_cost * 100.0) if total_portfolio_cost > 0 else 0.0
+pnl_color = "#00875A" if total_combined_pnl >= 0 else "#e5443b"
 
 st.html(f"""
 <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:14px; margin-top:12px; margin-bottom:28px;">
     <div class="metric-card" style="border-top:3px solid #2E384C;">
-        <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Total Invested Cost</div>
-        <div style="font-size:24px; font-weight:800; color:#1e293b;">${total_cost:,.2f}</div>
-        <div style="font-size:12px; color:#64748b; margin-top:4px;">{len(positions)} position(s) tracked</div>
+        <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Total Invested Capital</div>
+        <div style="font-size:24px; font-weight:800; color:#1e293b;">${total_portfolio_cost:,.2f}</div>
+        <div style="font-size:12px; color:#64748b; margin-top:4px;">Stock: ${total_stock_cost:,.0f} &bull; CSP Collateral: ${total_csp_collateral:,.0f}</div>
     </div>
     <div class="metric-card" style="border-top:3px solid #0284c7;">
         <div style="font-size:12px; font-weight:700; color:#0284c7; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Current Market Value</div>
-        <div style="font-size:24px; font-weight:800; color:#1e293b;">${total_value:,.2f}</div>
-        <div style="font-size:12px; color:#64748b; margin-top:4px;">Live market quotes</div>
+        <div style="font-size:24px; font-weight:800; color:#1e293b;">${total_portfolio_value:,.2f}</div>
+        <div style="font-size:12px; color:#64748b; margin-top:4px;">Stock: ${total_stock_value:,.0f} &bull; Cash Collateral: ${total_csp_collateral:,.0f}</div>
     </div>
     <div class="metric-card" style="border-top:3px solid {pnl_color};">
         <div style="font-size:12px; font-weight:700; color:{pnl_color}; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Total Unrealized P&amp;L</div>
         <div style="font-size:24px; font-weight:800; color:{pnl_color};">{total_pnl_pct:+.2f}%</div>
-        <div style="font-size:12px; color:{pnl_color}; font-weight:600; margin-top:4px;">${total_pnl:+,.2f} overall stock gain/loss</div>
+        <div style="font-size:12px; color:{pnl_color}; font-weight:600; margin-top:4px;">${total_combined_pnl:+,.2f} (Stock: ${total_stock_pnl:+,.0f} &bull; CSP: ${total_csp_pnl:+,.0f})</div>
     </div>
     <div class="metric-card" style="border-top:3px solid #00875A;">
         <div style="font-size:12px; font-weight:700; color:#00875A; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Active Option Income</div>
@@ -167,6 +202,7 @@ st.html(f"""
     </div>
 </div>
 """)
+
 
 # ---------------------------------------------------------
 # ADD NEW POSITION FORM
@@ -271,52 +307,88 @@ if not positions:
 else:
     for idx, pos in enumerate(positions):
         t = pos["ticker"]
-        shs = pos["shares"]
-        cost = pos["cost_basis"]
+        shs = pos.get("shares", 0)
+        cost = pos.get("cost_basis", 0.0)
         p_date = pos.get("purchase_date", "N/A")
         notes = pos.get("notes", "")
 
         cc = pos.get("covered_call", {})
         csp = pos.get("cash_secured_put", {})
+        has_cc = bool(cc and cc.get("active"))
+        has_csp = bool(csp and csp.get("active"))
+        is_pure_csp = has_csp and not has_cc and ("cash secured put" in notes.lower() or not has_cc)
 
         cur_p = live_quotes.get(t, cost)
+
+        # ---------------- 1. Covered Call / Stock Calculations ----------------
         pos_cost = shs * cost
         pos_val = shs * cur_p
         pos_pnl = pos_val - pos_cost
         pos_pnl_pct = (pos_pnl / pos_cost * 100.0) if pos_cost > 0 else 0.0
         cc_contracts = shs // 100
+        pos_color = "#00875A" if pos_pnl >= 0 else "#e5443b"
+        cc_cnt_val = int(cc.get("contracts", max(cc_contracts, 1))) if has_cc else cc_contracts
+        cc_prem_val = float(cc.get("premium", 0.0)) if has_cc else 0.0
 
+        # ---------------- 2. Cash Secured Put Calculations ----------------
+        csp_cnt_val = int(csp.get("contracts", 1)) if has_csp else 1
+        csp_strike_val = float(csp.get("strike", cost)) if has_csp else float(cost)
+        csp_prem_val = float(csp.get("premium", 0.0)) if has_csp else 0.0
+        csp_open_val = csp.get("open_date", "N/A") if has_csp else "N/A"
+        csp_exp_val = csp.get("expiration", "N/A") if has_csp else "N/A"
+        csp_collateral = csp_strike_val * 100 * csp_cnt_val
+        csp_income = csp_prem_val * 100 * csp_cnt_val
+        csp_breakeven = csp_strike_val - csp_prem_val
+
+        # Safety buffer vs Put Strike
+        if csp_strike_val > 0:
+            csp_diff = cur_p - csp_strike_val
+            csp_diff_pct = (csp_diff / csp_strike_val) * 100.0
+            if cur_p >= csp_strike_val:
+                csp_otm_str = f"+{csp_diff_pct:.1f}% OTM Safe"
+                csp_otm_color = "#00875A"
+            else:
+                csp_otm_str = f"{csp_diff_pct:.1f}% ITM"
+                csp_otm_color = "#e5443b"
+        else:
+            csp_otm_str = ""
+            csp_otm_color = "#64748b"
+
+        # CSP Unrealized P&L: If spot >= strike, 100% of premium is kept. If below, intrinsic loss offset by premium.
+        if has_csp:
+            if cur_p >= csp_strike_val:
+                csp_pnl = csp_income
+            else:
+                intrinsic_loss = (csp_strike_val - cur_p) * 100 * csp_cnt_val
+                csp_pnl = csp_income - intrinsic_loss
+            csp_pnl_pct = (csp_pnl / csp_collateral * 100.0) if csp_collateral > 0 else 0.0
+            csp_pnl_color = "#00875A" if csp_pnl >= 0 else "#e5443b"
+        else:
+            csp_pnl = 0.0
+            csp_pnl_pct = 0.0
+            csp_pnl_color = "#64748b"
+
+        # Holding duration
         try:
-            days_held = (date.today() - datetime.strptime(p_date, "%Y-%m-%d").date()).days
-            days_str = f"{days_held} days held"
+            ref_date = csp_open_val if (is_pure_csp and csp_open_val != "N/A") else p_date
+            days_held = (date.today() - datetime.strptime(ref_date, "%Y-%m-%d").date()).days
+            days_str = f"{days_held} days open" if is_pure_csp else f"{days_held} days held"
         except Exception:
             days_str = ""
 
-        pos_color = "#00875A" if pos_pnl >= 0 else "#e5443b"
-
         # Badges for active options with all 5 details
         options_badges_html = []
-        if cc and cc.get("active"):
-            cc_cnt_val = cc.get("contracts", 1)
-            cc_strike_val = cc.get("strike", 0.0)
-            cc_exp_val = cc.get("expiration", "")
-            cc_prem_val = cc.get("premium", 0.0)
-            cc_open_val = cc.get("open_date", "N/A")
+        if has_cc:
             total_cc_cash = cc_prem_val * 100 * cc_cnt_val
             options_badges_html.append(
                 f'<div style="background:#f0f9ff; color:#0369a1; border:1px solid #bae6fd; padding:6px 12px; border-radius:8px; font-size:13px; line-height:1.4;">'
-                f'<b>🪙 Active Covered Call</b>: <b>{cc_cnt_val} option(s)</b> &bull; <b>${cc_strike_val:.2f} Strike</b> &bull; '
-                f'Premium: <b>+${cc_prem_val:.2f}/sh</b> (+${total_cc_cash:,.2f}) &bull; '
-                f'Opened: <b>{cc_open_val}</b> &bull; Expiry: <b>{cc_exp_val}</b>'
+                f'<b>🪙 Active Covered Call</b>: <b>{cc_cnt_val} option(s)</b> &bull; <b>${cc.get("strike", 0.0):.2f} Strike</b> &bull; '
+                f'Premium: <b>+${cc.get("premium", 0.0):.2f}/sh</b> (+${total_cc_cash:,.2f}) &bull; '
+                f'Opened: <b>{cc.get("open_date", "N/A")}</b> &bull; Expiry: <b>{cc.get("expiration", "")}</b>'
                 f'</div>'
             )
 
-        if csp and csp.get("active"):
-            csp_cnt_val = csp.get("contracts", 1)
-            csp_strike_val = csp.get("strike", 0.0)
-            csp_exp_val = csp.get("expiration", "")
-            csp_prem_val = csp.get("premium", 0.0)
-            csp_open_val = csp.get("open_date", "N/A")
+        if has_csp:
             total_csp_cash = csp_prem_val * 100 * csp_cnt_val
             options_badges_html.append(
                 f'<div style="background:#fefce8; color:#854d0e; border:1px solid #fef08a; padding:6px 12px; border-radius:8px; font-size:13px; line-height:1.4;">'
@@ -326,39 +398,124 @@ else:
                 f'</div>'
             )
 
-        badges_rendered = f'<div style="display:flex; flex-direction:column; gap:6px; margin-top:10px;">{" ".join(options_badges_html)}</div>' if options_badges_html else ''
+        badges_rendered = f'<div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">{" ".join(options_badges_html)}</div>' if options_badges_html else ''
+
+        # Visual theme & labels
+        if is_pure_csp:
+            card_border = "#b45309"
+            badge_bg = "#fefce8"
+            badge_txt = "#854d0e"
+            badge_border = "#fef08a"
+            strategy_label = "Cash Secured Put Holding"
+            subtitle_text = f"Strike: <b>${csp_strike_val:.2f}</b> &bull; Collateral: <b>${csp_collateral:,.2f}</b> &bull; Opened on {csp_open_val} {f'({days_str})' if days_str else ''}"
+        elif has_cc and has_csp:
+            card_border = "#00875A"
+            badge_bg = "#f0fdf4"
+            badge_txt = "#166534"
+            badge_border = "#bbf7d0"
+            strategy_label = "Dual Strategy (CC + CSP Wheel)"
+            subtitle_text = f"{shs:,} shares &bull; Bought @ <b>${cost:.2f}</b> on {p_date} {f'({days_str})' if days_str else ''}"
+        elif has_cc:
+            card_border = "#0284c7"
+            badge_bg = "#f0f9ff"
+            badge_txt = "#0369a1"
+            badge_border = "#bae6fd"
+            strategy_label = "Covered Call Holding"
+            subtitle_text = f"{shs:,} shares &bull; Bought @ <b>${cost:.2f}</b> on {p_date} {f'({days_str})' if days_str else ''}"
+        else:
+            card_border = "#2E384C"
+            badge_bg = "#f1f5f9"
+            badge_txt = "#334155"
+            badge_border = "#cbd5e1"
+            strategy_label = "Stock Holding"
+            subtitle_text = f"{shs:,} shares &bull; Bought @ <b>${cost:.2f}</b> on {p_date} {f'({days_str})' if days_str else ''}"
+
+        # HTML row for Covered Call Metrics
+        cc_metric_row = f"""
+        <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+            <div style="display:flex; align-items:center; gap:8px; min-width:160px;">
+                <span style="font-size:16px;">🪙</span>
+                <div>
+                    <div style="font-size:12px; font-weight:700; color:#0369a1; text-transform:uppercase; letter-spacing:0.03em;">Covered Call</div>
+                    <div style="font-size:11px; color:#64748b;">{'Active CC Option' if has_cc else ('Stock Position' if not is_pure_csp else 'Awaiting Assignment')}</div>
+                </div>
+            </div>
+            <div style="display:flex; gap:22px; align-items:center; flex-wrap:wrap;">
+                <div style="text-align:right;">
+                    <div style="font-size:11px; color:#64748b; font-weight:600;">Spot Price</div>
+                    <div style="font-size:16px; font-weight:700; color:#1e293b;">${cur_p:.2f}</div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:11px; color:#64748b; font-weight:600;">Market Value</div>
+                    <div style="font-size:16px; font-weight:700; color:#1e293b;">{f'${pos_val:,.2f}' if not is_pure_csp else '—'}</div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:11px; color:#64748b; font-weight:600;">Unrealized P&amp;L</div>
+                    <div style="font-size:16px; font-weight:800; color:{pos_color};">{f'{pos_pnl_pct:+.2f}% (${pos_pnl:+,.2f})' if not is_pure_csp else '—'}</div>
+                </div>
+                <div style="text-align:right; min-width:90px;">
+                    <div style="font-size:11px; color:#00875A; font-weight:600;">CC Ready</div>
+                    <div style="font-size:16px; font-weight:800; color:#00875A;">{f'{cc_cnt_val} contract(s)' if not is_pure_csp else '0 (if assigned)'}</div>
+                </div>
+            </div>
+        </div>
+        """
+
+        # HTML row for Cash Secured Put Metrics
+        csp_metric_row = f"""
+        <div style="background:#fefce8; border:1px solid #fef08a; border-radius:8px; padding:10px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+            <div style="display:flex; align-items:center; gap:8px; min-width:160px;">
+                <span style="font-size:16px;">💰</span>
+                <div>
+                    <div style="font-size:12px; font-weight:700; color:#854d0e; text-transform:uppercase; letter-spacing:0.03em;">Cash Secured Put</div>
+                    <div style="font-size:11px; color:#a16207;">{'Active Put Option' if has_csp else 'Ready to Sell'}</div>
+                </div>
+            </div>
+            <div style="display:flex; gap:22px; align-items:center; flex-wrap:wrap;">
+                <div style="text-align:right;">
+                    <div style="font-size:11px; color:#64748b; font-weight:600;">Spot Price</div>
+                    <div style="font-size:16px; font-weight:700; color:#1e293b;">${cur_p:.2f} {f'<span style="font-size:11px; font-weight:700; color:{csp_otm_color};">({csp_otm_str})</span>' if has_csp else ''}</div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:11px; color:#64748b; font-weight:600;">Market Value</div>
+                    <div style="font-size:16px; font-weight:700; color:#1e293b;">${csp_collateral:,.2f}</div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:11px; color:#64748b; font-weight:600;">Unrealized P&amp;L</div>
+                    <div style="font-size:16px; font-weight:800; color:{csp_pnl_color};">{f'{csp_pnl_pct:+.2f}% (${csp_pnl:+,.2f})' if has_csp else '—'}</div>
+                </div>
+                <div style="text-align:right; min-width:90px;">
+                    <div style="font-size:11px; color:#b45309; font-weight:600;">CSP Ready</div>
+                    <div style="font-size:16px; font-weight:800; color:#b45309;">{csp_cnt_val} contract(s){' Active' if has_csp else ' Ready'}</div>
+                </div>
+            </div>
+        </div>
+        """
+
+        # Order rows: if pure CSP, show CSP first; otherwise show CC first
+        if is_pure_csp:
+            metrics_html = f'<div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">{csp_metric_row}{cc_metric_row}</div>'
+        else:
+            metrics_html = f'<div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">{cc_metric_row}{csp_metric_row}</div>'
 
         with st.container():
             st.html(f"""
-            <div style="background:#ffffff; border:1px solid #e2e8f0; border-left:4px solid {'#00875A' if cc_contracts > 0 else '#2E384C'}; border-radius:12px; padding:18px 22px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,0.03);">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+            <div style="background:#ffffff; border:1px solid #e2e8f0; border-left:4px solid {card_border}; border-radius:12px; padding:18px 22px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,0.03);">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
                     <div>
-                        <span style="font-size:20px; font-weight:800; color:#1e293b;">{t}</span>
-                        <span style="font-size:14px; color:#64748b; margin-left:10px;">{shs:,} shares &bull; Bought @ <b>${cost:.2f}</b> on {p_date} {f'({days_str})' if days_str else ''}</span>
-                        {f'<div style="font-size:12px; color:#64748b; margin-top:4px; font-style:italic;">"{notes}"</div>' if notes else ''}
+                        <div style="display:flex; align-items:center; gap:10px;">
+                            <span style="font-size:22px; font-weight:800; color:#1e293b;">{t}</span>
+                            <span style="background:{badge_bg}; color:{badge_txt}; border:1px solid {badge_border}; font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; text-transform:uppercase;">{strategy_label}</span>
+                        </div>
+                        <div style="font-size:13px; color:#64748b; margin-top:4px;">{subtitle_text}</div>
+                        {f'<div style="font-size:12px; color:#64748b; margin-top:3px; font-style:italic;">"{notes}"</div>' if notes else ''}
                         {badges_rendered}
                     </div>
-                    <div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap;">
-                        <div style="text-align:right;">
-                            <div style="font-size:12px; color:#64748b; font-weight:600;">Spot Price</div>
-                            <div style="font-size:16px; font-weight:700; color:#1e293b;">${cur_p:.2f}</div>
-                        </div>
-                        <div style="text-align:right;">
-                            <div style="font-size:12px; color:#64748b; font-weight:600;">Market Value</div>
-                            <div style="font-size:16px; font-weight:700; color:#1e293b;">${pos_val:,.2f}</div>
-                        </div>
-                        <div style="text-align:right;">
-                            <div style="font-size:12px; color:#64748b; font-weight:600;">Unrealized P&amp;L</div>
-                            <div style="font-size:16px; font-weight:800; color:{pos_color};">{pos_pnl_pct:+.2f}% (${pos_pnl:+,.2f})</div>
-                        </div>
-                        <div style="text-align:right;">
-                            <div style="font-size:12px; color:#00875A; font-weight:600;">CC Ready</div>
-                            <div style="font-size:16px; font-weight:800; color:#00875A;">{cc_contracts} contract(s)</div>
-                        </div>
-                    </div>
                 </div>
+                {metrics_html}
             </div>
             """)
+
 
             col_btn1, col_btn2, col_btn3 = st.columns([1.5, 1.5, 0.6])
             with col_btn1:

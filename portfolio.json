@@ -46,5 +46,43 @@
       "strike": 115.0,
       "premium": 4.6
     }
+  },
+  {
+    "id": "pos_111a4034",
+    "ticker": "OLED",
+    "shares": 100,
+    "cost_basis": 65.0,
+    "purchase_date": "2026-09-15",
+    "notes": "Auto-created from Cash Secured Put",
+    "covered_call": {
+      "active": false
+    },
+    "cash_secured_put": {
+      "active": true,
+      "contracts": 1,
+      "open_date": "2026-09-15",
+      "expiration": "2026-12-18",
+      "strike": 65.0,
+      "premium": 3.1
+    }
+  },
+  {
+    "id": "pos_e913acc3",
+    "ticker": "NRG",
+    "shares": 100,
+    "cost_basis": 105.0,
+    "purchase_date": "2026-09-14",
+    "notes": "Auto-created from Cash Secured Put",
+    "covered_call": {
+      "active": false
+    },
+    "cash_secured_put": {
+      "active": true,
+      "contracts": 1,
+      "open_date": "2026-09-14",
+      "expiration": "2026-10-23",
+      "strike": 105.0,
+      "premium": 5.0
+    }
   }
 ]
