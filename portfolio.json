@@ -1,0 +1,50 @@
+[
+  {
+    "id": "pos_84844941",
+    "ticker": "MSTR",
+    "shares": 100,
+    "cost_basis": 133.2,
+    "purchase_date": "2026-09-11",
+    "notes": "",
+    "covered_call": {
+      "active": true,
+      "contracts": 1,
+      "open_date": "2026-09-18",
+      "expiration": "2027-12-17",
+      "strike": 125.0,
+      "premium": 63.16
+    },
+    "cash_secured_put": {
+      "active": true,
+      "contracts": 1,
+      "open_date": "2026-10-08",
+      "expiration": "2027-01-15",
+      "strike": 115.0,
+      "premium": 5.0
+    }
+  },
+  {
+    "id": "pos_f7f07ab4",
+    "ticker": "ORCL",
+    "shares": 100,
+    "cost_basis": 153.8,
+    "purchase_date": "2026-09-11",
+    "notes": "",
+    "covered_call": {
+      "active": true,
+      "contracts": 1,
+      "open_date": "2026-09-17",
+      "expiration": "2027-04-16",
+      "strike": 140.0,
+      "premium": 30.01
+    },
+    "cash_secured_put": {
+      "active": true,
+      "contracts": 1,
+      "open_date": "2026-10-08",
+      "expiration": "2027-01-15",
+      "strike": 115.0,
+      "premium": 4.6
+    }
+  }
+]

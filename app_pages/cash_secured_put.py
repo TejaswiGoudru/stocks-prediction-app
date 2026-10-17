@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,6 +11,8 @@ from utils import (
     fetch_put_chain,
     fetch_stock_forecast,
     fetch_walletinvestor_data,
+    load_portfolio,
+    save_or_update_option_position,
 )
 
 st.html(COMMON_CSS)
@@ -22,7 +24,61 @@ st.markdown("Sell cash-secured puts below technical support to generate steady i
 if "ticker" not in st.session_state:
     st.session_state.ticker = "ORCL"
 
-col_top1, col_top2, col_top3 = st.columns([1.5, 1.8, 1.2])
+# Load saved positions from portfolio
+positions = load_portfolio()
+portfolio_labels = ["✏️ Custom Entry (Manual Input)"]
+for p in positions:
+    csp = p.get("cash_secured_put", {})
+    if csp and csp.get("active"):
+        csp_info = f"💰 Active CSP: ${csp.get('strike', 0):.2f} exp {csp.get('expiration', '')}"
+    else:
+        csp_info = f"{p.get('shares', 100)} shs"
+    portfolio_labels.append(f"{p['ticker']} • ({csp_info})")
+
+selected_port_idx = 0
+if "selected_portfolio_id" in st.session_state and st.session_state.selected_portfolio_id:
+    for idx, p in enumerate(positions):
+        if p["id"] == st.session_state.selected_portfolio_id:
+            selected_port_idx = idx + 1
+            break
+
+col_pick, col_link = st.columns([2.4, 1.0])
+with col_pick:
+    chosen_pos_idx = st.selectbox(
+        "⚡ Quick Select from Saved Portfolio:",
+        options=range(len(portfolio_labels)),
+        format_func=lambda i: portfolio_labels[i],
+        index=selected_port_idx,
+        help="Select any saved stock position to instantly load ticker, active cash secured put details, or contracts.",
+    )
+
+with col_link:
+    st.write("")
+    st.page_link("app_pages/portfolio.py", label="Manage Portfolio Holdings →", icon=":material/account_balance_wallet:")
+
+if chosen_pos_idx > 0:
+    chosen_pos = positions[chosen_pos_idx - 1]
+    if st.session_state.get("last_selected_port_csp_idx") != chosen_pos_idx:
+        st.session_state.last_selected_port_csp_idx = chosen_pos_idx
+        st.session_state.ticker = chosen_pos["ticker"]
+        csp = chosen_pos.get("cash_secured_put", {})
+        if csp and csp.get("active"):
+            st.session_state.csp_target_exp = str(csp.get("expiration", ""))
+            st.session_state.csp_target_open_date = str(csp.get("open_date", ""))
+            st.session_state.csp_target_strike = float(csp.get("strike", 0.0))
+            st.session_state.csp_target_premium = float(csp.get("premium", 0.0))
+            st.session_state.csp_contracts = int(csp.get("contracts", 1))
+        else:
+            st.session_state.csp_target_exp = None
+            st.session_state.csp_target_open_date = None
+            st.session_state.csp_target_strike = None
+            st.session_state.csp_target_premium = None
+            st.session_state.csp_contracts = 1
+else:
+    if st.session_state.get("last_selected_port_csp_idx", 0) != 0:
+        st.session_state.last_selected_port_csp_idx = 0
+
+col_top1, col_top_open, col_top2, col_top3 = st.columns([1.3, 1.3, 1.6, 1.0])
 
 with col_top1:
     ticker_val = st.text_input(
@@ -34,6 +90,20 @@ with col_top1:
         st.session_state.ticker = ticker_val
 
 ticker_input = st.session_state.ticker
+
+with col_top_open:
+    csp_open_def = date.today() - timedelta(days=7)
+    if st.session_state.get("csp_target_open_date"):
+        try:
+            csp_open_def = datetime.strptime(st.session_state.csp_target_open_date, "%Y-%m-%d").date()
+        except:
+            pass
+    csp_open_date = st.date_input(
+        "Option Open Date",
+        value=csp_open_def,
+        max_value=date.today(),
+        help="Date when you originally sold/opened this cash secured put.",
+    )
 
 if ticker_input:
     data, err = fetch_stock_forecast(ticker_input)
@@ -47,7 +117,7 @@ if ticker_input:
             st.warning(f"No options chain data available for ticker {data['ticker']}.")
             st.stop()
 
-        # Find best default expiration (closest to 30-45 DTE - classic CSP sweet spot)
+        # Find best default expiration (matches saved target or closest to 30-45 DTE)
         now_dt = datetime.now()
         exp_dtes = []
         for e in available_exps:
@@ -58,12 +128,22 @@ if ticker_input:
                 pass
 
         ideal_idx = 0
-        min_diff = 9999
-        for i, (e, d) in enumerate(exp_dtes):
-            diff = abs(d - 35)
-            if diff < min_diff:
-                min_diff = diff
-                ideal_idx = i
+        target_exp = st.session_state.get("csp_target_exp")
+        found_target_exp = False
+        if target_exp:
+            for i, (e, d) in enumerate(exp_dtes):
+                if e == target_exp:
+                    ideal_idx = i
+                    found_target_exp = True
+                    break
+
+        if not found_target_exp:
+            min_diff = 9999
+            for i, (e, d) in enumerate(exp_dtes):
+                diff = abs(d - 35)
+                if diff < min_diff:
+                    min_diff = diff
+                    ideal_idx = i
 
         with col_top2:
             exp_labels = [f"{e} ({d} DTE)" for e, d in exp_dtes]
@@ -78,8 +158,9 @@ if ticker_input:
 
         with col_top3:
             contracts_qty = st.number_input(
-                "Contracts", min_value=1, max_value=100, value=1, step=1
+                "Contracts", min_value=1, max_value=100, value=int(st.session_state.get("csp_contracts", 1)), step=1
             )
+            st.session_state.csp_contracts = contracts_qty
 
         # Pull put chain for selected expiration
         puts_df = fetch_put_chain(data["ticker"], selected_exp)
@@ -136,13 +217,24 @@ if ticker_input:
             .reset_index(drop=True)
         )
 
+        # Strike selection: match target strike if saved in portfolio, otherwise target Delta ~ 0.25
         default_strike_idx = 0
-        min_delta_diff = 999.0
-        for idx, row in options_data_df.iterrows():
-            diff = abs(abs(row["delta"]) - 0.25)
-            if diff < min_delta_diff:
-                min_delta_diff = diff
-                default_strike_idx = idx
+        target_strike = st.session_state.get("csp_target_strike")
+        found_strike = False
+        if target_strike:
+            for idx, row in options_data_df.iterrows():
+                if abs(row["strike"] - target_strike) < 0.01:
+                    default_strike_idx = idx
+                    found_strike = True
+                    break
+
+        if not found_strike:
+            min_delta_diff = 999.0
+            for idx, row in options_data_df.iterrows():
+                diff = abs(abs(row["delta"]) - 0.25)
+                if diff < min_delta_diff:
+                    min_delta_diff = diff
+                    default_strike_idx = idx
 
         # Fetch WalletInvestor technical support levels to display context
         wi_data = fetch_walletinvestor_data(
@@ -185,15 +277,49 @@ if ticker_input:
 
         chosen_option = options_data_df[options_data_df["strike"] == selected_strike].iloc[0]
 
+        prem_val = float(chosen_option["mid"])
+        if st.session_state.get("csp_target_premium") and found_strike:
+            prem_val = float(st.session_state.csp_target_premium)
+
         with col_premium:
             user_premium = st.number_input(
                 "Option Premium per Share ($)",
                 min_value=0.01,
                 max_value=float(selected_strike),
-                value=float(chosen_option["mid"]),
+                value=prem_val,
                 step=0.05,
                 format="%.2f",
             )
+
+        exp_date_obj = datetime.strptime(selected_exp, "%Y-%m-%d").date()
+        days_option_open = max((date.today() - csp_open_date).days, 0)
+        total_option_duration = max((exp_date_obj - csp_open_date).days, 1)
+
+        # Action bar with timeline & save button
+        col_act_left, col_act_right = st.columns([2.6, 1.2])
+        with col_act_left:
+            st.html(f"""
+            <div style="font-size:13px; color:#475569; padding:8px 0;">
+                ⏱️ <b>Option Timeline</b>: Sold on <b>{csp_open_date.strftime('%b %d, %Y')}</b> ({days_option_open}d ago) &bull;
+                Expiry: <b>{selected_exp}</b> ({selected_dte}d DTE remaining) &bull;
+                Total Duration: <b>{total_option_duration} days</b>
+            </div>
+            """)
+        with col_act_right:
+            if st.button("💾 Save CSP to Portfolio", type="primary", help=f"Save active Cash Secured Put for {data['ticker']} into portfolio"):
+                save_or_update_option_position(
+                    data["ticker"],
+                    "cash_secured_put",
+                    {
+                        "active": True,
+                        "contracts": int(contracts_qty),
+                        "open_date": str(csp_open_date),
+                        "expiration": str(selected_exp),
+                        "strike": float(selected_strike),
+                        "premium": float(user_premium),
+                    },
+                )
+                st.toast(f"Saved active Cash Secured Put for {data['ticker']} into Portfolio!", icon="💾")
 
         total_collateral = selected_strike * 100 * contracts_qty
         total_premium = user_premium * 100 * contracts_qty

@@ -1,5 +1,8 @@
+import json
 import math
+import os
 import re
+import uuid
 from datetime import datetime
 import pandas as pd
 import requests
@@ -328,3 +331,131 @@ def fetch_walletinvestor_data(
         }
 
     return {"scenarios": scenarios, "trading": trading_data}
+
+
+# ---------------------------------------------------------
+# PORTFOLIO PERSISTENCE & MANAGEMENT
+# ---------------------------------------------------------
+PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
+
+
+def load_portfolio():
+    """Loads saved portfolio holdings from local JSON file."""
+    if not os.path.exists(PORTFOLIO_FILE):
+        default_data = [
+            {
+                "id": "pos_orcl_default",
+                "ticker": "ORCL",
+                "shares": 100,
+                "cost_basis": 160.00,
+                "purchase_date": "2026-08-15",
+                "notes": "Core tech position for covered calls",
+            }
+        ]
+        save_portfolio(default_data)
+        return default_data
+
+    try:
+        with open(PORTFOLIO_FILE, "r") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception:
+        return []
+
+
+def save_portfolio(positions):
+    """Saves portfolio holdings list to local JSON file."""
+    try:
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def add_portfolio_position(
+    ticker: str,
+    shares: int,
+    cost_basis: float,
+    purchase_date: str,
+    notes: str = "",
+    covered_call: dict = None,
+    cash_secured_put: dict = None,
+):
+    """Adds a new stock position with optional active covered call & cash secured put positions."""
+    positions = load_portfolio()
+    new_pos = {
+        "id": f"pos_{uuid.uuid4().hex[:8]}",
+        "ticker": ticker.strip().upper(),
+        "shares": int(shares),
+        "cost_basis": round(float(cost_basis), 2),
+        "purchase_date": str(purchase_date),
+        "notes": notes.strip(),
+        "covered_call": covered_call or {"active": False},
+        "cash_secured_put": cash_secured_put or {"active": False},
+    }
+    positions.append(new_pos)
+    save_portfolio(positions)
+    return new_pos
+
+
+def update_portfolio_position(pos_id: str, updated_data: dict):
+    """Updates an existing portfolio position by ID."""
+    positions = load_portfolio()
+    for i, p in enumerate(positions):
+        if p.get("id") == pos_id:
+            positions[i].update(updated_data)
+            break
+    save_portfolio(positions)
+    return True
+
+
+def save_or_update_option_position(ticker: str, option_type: str, option_data: dict):
+    """Saves or updates active covered_call or cash_secured_put for a ticker."""
+    positions = load_portfolio()
+    found = False
+    for i, p in enumerate(positions):
+        if p.get("ticker", "").upper() == ticker.strip().upper():
+            positions[i][option_type] = option_data
+            found = True
+            break
+    if not found:
+        new_pos = {
+            "id": f"pos_{uuid.uuid4().hex[:8]}",
+            "ticker": ticker.strip().upper(),
+            "shares": option_data.get("contracts", 1) * 100,
+            "cost_basis": float(option_data.get("strike", 100.0)),
+            "purchase_date": option_data.get("open_date", str(datetime.now().date())),
+            "notes": f"Auto-created from {option_type.replace('_', ' ').title()}",
+            "covered_call": option_data if option_type == "covered_call" else {"active": False},
+            "cash_secured_put": option_data if option_type == "cash_secured_put" else {"active": False},
+        }
+        positions.append(new_pos)
+    save_portfolio(positions)
+    return True
+
+
+def delete_portfolio_position(pos_id: str):
+    """Deletes a stock position by ID."""
+    positions = load_portfolio()
+    filtered = [p for p in positions if p.get("id") != pos_id]
+    save_portfolio(filtered)
+    return True
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_current_quote(ticker_symbol: str):
+    """Pulls current spot price and daily change for portfolio display."""
+    try:
+        t = yf.Ticker(ticker_symbol.upper())
+        hist = t.history(period="5d", interval="1d")
+        if not hist.empty:
+            close = float(hist["Close"].iloc[-1])
+            prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else close
+            change_pct = ((close - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
+            return close, change_pct
+    except Exception:
+        pass
+    return None, 0.0

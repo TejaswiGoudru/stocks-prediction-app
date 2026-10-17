@@ -11,6 +11,8 @@ from utils import (
     fetch_option_expirations,
     fetch_stock_forecast,
     fetch_walletinvestor_data,
+    load_portfolio,
+    save_or_update_option_position,
 )
 
 st.html(COMMON_CSS)
@@ -31,6 +33,64 @@ st.html("""
     <h4 style="margin:0; font-size:17px; font-weight:700; color:#1e293b; letter-spacing:-0.01em;">1. Underlying Stock Holding Details</h4>
 </div>
 """)
+
+# Load saved positions from portfolio
+positions = load_portfolio()
+portfolio_labels = ["✏️ Custom Entry (Manual Input)"]
+for p in positions:
+    cc = p.get("covered_call", {})
+    if cc and cc.get("active"):
+        cc_info = f"🪙 Active CC: ${cc.get('strike', 0):.2f} exp {cc.get('expiration', '')}"
+    else:
+        cc_info = f"Bought {p.get('purchase_date', '')}"
+    portfolio_labels.append(f"{p['ticker']} • {p['shares']:,} shs @ ${p['cost_basis']:.2f} ({cc_info})")
+
+selected_port_idx = 0
+if "selected_portfolio_id" in st.session_state and st.session_state.selected_portfolio_id:
+    for idx, p in enumerate(positions):
+        if p["id"] == st.session_state.selected_portfolio_id:
+            selected_port_idx = idx + 1
+            break
+
+col_pick, col_link = st.columns([2.4, 1.0])
+with col_pick:
+    chosen_pos_idx = st.selectbox(
+        "⚡ Quick Select from Saved Portfolio:",
+        options=range(len(portfolio_labels)),
+        format_func=lambda i: portfolio_labels[i],
+        index=selected_port_idx,
+        help="Select any saved stock position to instantly load ticker, cost basis, purchase date, contract quantity, and active covered call details.",
+    )
+
+with col_link:
+    st.write("")
+    st.page_link("app_pages/portfolio.py", label="Manage Portfolio Holdings →", icon=":material/account_balance_wallet:")
+
+# If a saved portfolio item was selected, synchronize values
+if chosen_pos_idx > 0:
+    chosen_pos = positions[chosen_pos_idx - 1]
+    if st.session_state.get("last_selected_port_idx") != chosen_pos_idx:
+        st.session_state.last_selected_port_idx = chosen_pos_idx
+        st.session_state.ticker = chosen_pos["ticker"]
+        st.session_state.cc_cost_basis = chosen_pos["cost_basis"]
+        try:
+            st.session_state.cc_purchase_date = datetime.strptime(chosen_pos["purchase_date"], "%Y-%m-%d").date()
+        except Exception:
+            pass
+        cc = chosen_pos.get("covered_call", {})
+        if cc and cc.get("active"):
+            st.session_state.cc_contracts = int(cc.get("contracts", max(chosen_pos["shares"] // 100, 1)))
+            st.session_state.cc_target_exp = str(cc.get("expiration", ""))
+            st.session_state.cc_target_strike = float(cc.get("strike", 0.0))
+            st.session_state.cc_target_premium = float(cc.get("premium", 0.0))
+        else:
+            st.session_state.cc_contracts = max(chosen_pos["shares"] // 100, 1)
+            st.session_state.cc_target_exp = None
+            st.session_state.cc_target_strike = None
+            st.session_state.cc_target_premium = None
+else:
+    if st.session_state.get("last_selected_port_idx", 0) != 0:
+        st.session_state.last_selected_port_idx = 0
 
 col_pos1, col_pos2, col_pos3, col_pos4 = st.columns([1.3, 1.4, 1.5, 1.2])
 
@@ -53,17 +113,19 @@ if ticker_input:
 
     current_p = data["current_price"]
 
-    # Manage session state for purchase price and date when ticker changes
+    # Manage session state for purchase price and date when ticker changes manually
     if "last_cc_ticker" not in st.session_state or st.session_state.last_cc_ticker != data["ticker"]:
         st.session_state.last_cc_ticker = data["ticker"]
-        st.session_state.cc_cost_basis = float(round(current_p, 2))
-        st.session_state.cc_purchase_date = date.today() - timedelta(days=60)
+        if chosen_pos_idx == 0:
+            st.session_state.cc_cost_basis = float(round(current_p, 2))
+            st.session_state.cc_purchase_date = date.today() - timedelta(days=60)
+            st.session_state.cc_contracts = 1
 
     with col_pos2:
         stock_basis = st.number_input(
             "Purchase Price / Share ($)",
             min_value=0.01,
-            value=float(st.session_state.cc_cost_basis),
+            value=float(st.session_state.get("cc_cost_basis", round(current_p, 2))),
             step=0.50,
             format="%.2f",
             help="The price per share you originally paid. All P&L, breakeven, and return calculations are based on this cost.",
@@ -73,21 +135,23 @@ if ticker_input:
     with col_pos3:
         purchase_date = st.date_input(
             "Stock Purchase Date",
-            value=st.session_state.cc_purchase_date,
+            value=st.session_state.get("cc_purchase_date", date.today() - timedelta(days=60)),
             max_value=date.today(),
             help="Date when you originally bought the shares. Used to compute holding period and annualized return (APR) since purchase.",
         )
         st.session_state.cc_purchase_date = purchase_date
 
     with col_pos4:
+        default_contracts = int(st.session_state.get("cc_contracts", 1))
         contracts_qty = st.number_input(
             "Contracts (100 shs)",
             min_value=1,
             max_value=500,
-            value=1,
+            value=default_contracts,
             step=1,
             help="1 option contract covers 100 shares of stock.",
         )
+        st.session_state.cc_contracts = contracts_qty
 
     # ---------------------------------------------------------
     # SECTION 2: COVERED CALL OPTION SELECTION
@@ -109,12 +173,22 @@ if ticker_input:
             pass
 
     ideal_idx = 0
-    min_diff = 9999
-    for i, (e, d) in enumerate(exp_dtes):
-        diff = abs(d - 35)
-        if diff < min_diff:
-            min_diff = diff
-            ideal_idx = i
+    target_exp = st.session_state.get("cc_target_exp")
+    found_target_exp = False
+    if target_exp:
+        for i, (e, d) in enumerate(exp_dtes):
+            if e == target_exp:
+                ideal_idx = i
+                found_target_exp = True
+                break
+
+    if not found_target_exp:
+        min_diff = 9999
+        for i, (e, d) in enumerate(exp_dtes):
+            diff = abs(d - 35)
+            if diff < min_diff:
+                min_diff = diff
+                ideal_idx = i
 
     st.html("""
     <div style="display:flex; align-items:center; margin-top:16px; margin-bottom:12px;">
@@ -123,7 +197,21 @@ if ticker_input:
     </div>
     """)
 
-    col_opt1, col_opt2, col_opt3 = st.columns([1.5, 2.0, 1.3])
+    col_opt_open, col_opt1, col_opt2, col_opt3 = st.columns([1.3, 1.4, 2.0, 1.2])
+
+    with col_opt_open:
+        cc_open_def = date.today() - timedelta(days=7)
+        if st.session_state.get("cc_target_open_date"):
+            try:
+                cc_open_def = datetime.strptime(st.session_state.cc_target_open_date, "%Y-%m-%d").date()
+            except:
+                pass
+        cc_open_date = st.date_input(
+            "Option Open Date",
+            value=cc_open_def,
+            max_value=date.today(),
+            help="Date when you originally sold/opened this covered call.",
+        )
 
     with col_opt1:
         exp_labels = [f"{e} ({d} DTE)" for e, d in exp_dtes]
@@ -214,14 +302,24 @@ if ticker_input:
         .reset_index(drop=True)
     )
 
-    # Default strike selection: target Delta ~ 0.30 (classic ~70% OTM probability sweet spot)
+    # Strike selection: match target strike if saved in portfolio, otherwise target Delta ~ 0.30
     default_strike_idx = 0
-    min_delta_diff = 999.0
-    for idx, row in options_data_df.iterrows():
-        diff = abs(row["delta"] - 0.30)
-        if diff < min_delta_diff:
-            min_delta_diff = diff
-            default_strike_idx = idx
+    target_strike = st.session_state.get("cc_target_strike")
+    found_strike = False
+    if target_strike:
+        for idx, row in options_data_df.iterrows():
+            if abs(row["strike"] - target_strike) < 0.01:
+                default_strike_idx = idx
+                found_strike = True
+                break
+
+    if not found_strike:
+        min_delta_diff = 999.0
+        for idx, row in options_data_df.iterrows():
+            diff = abs(row["delta"] - 0.30)
+            if diff < min_delta_diff:
+                min_delta_diff = diff
+                default_strike_idx = idx
 
     with col_opt2:
         strike_options = options_data_df["strike"].tolist()
@@ -238,15 +336,48 @@ if ticker_input:
 
     chosen_option = options_data_df[options_data_df["strike"] == selected_strike].iloc[0]
 
+    prem_val = float(chosen_option["mid"])
+    if st.session_state.get("cc_target_premium") and found_strike:
+        prem_val = float(st.session_state.cc_target_premium)
+
     with col_opt3:
         user_premium = st.number_input(
             "Option Premium per Share ($)",
             min_value=0.01,
             max_value=float(selected_strike),
-            value=float(chosen_option["mid"]),
+            value=prem_val,
             step=0.05,
             format="%.2f",
         )
+
+    days_option_open = max((date.today() - cc_open_date).days, 0)
+    total_option_duration = max((exp_date_obj - cc_open_date).days, 1)
+
+    # Action bar with timeline & save button
+    col_act_left, col_act_right = st.columns([2.6, 1.2])
+    with col_act_left:
+        st.html(f"""
+        <div style="font-size:13px; color:#475569; padding:8px 0;">
+            ⏱️ <b>Option Timeline</b>: Sold on <b>{cc_open_date.strftime('%b %d, %Y')}</b> ({days_option_open}d ago) &bull;
+            Expiry: <b>{selected_exp}</b> ({selected_dte}d DTE remaining) &bull;
+            Total Duration: <b>{total_option_duration} days</b>
+        </div>
+        """)
+    with col_act_right:
+        if st.button("💾 Save CC to Portfolio", type="primary", help=f"Save active Covered Call for {data['ticker']} into portfolio"):
+            save_or_update_option_position(
+                data["ticker"],
+                "covered_call",
+                {
+                    "active": True,
+                    "contracts": int(contracts_qty),
+                    "open_date": str(cc_open_date),
+                    "expiration": str(selected_exp),
+                    "strike": float(selected_strike),
+                    "premium": float(user_premium),
+                },
+            )
+            st.toast(f"Saved active Covered Call for {data['ticker']} into Portfolio!", icon="💾")
 
     # ---------------------------------------------------------
     # POSITION P&L & RETURN CALCULATIONS (ANCHORED TO COST & DATE)
