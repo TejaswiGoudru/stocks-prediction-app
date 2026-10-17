@@ -11,7 +11,10 @@ from utils import (
     fetch_put_chain,
     fetch_stock_forecast,
     fetch_walletinvestor_data,
+    get_stock_branding_and_ratings,
     load_portfolio,
+    render_analyst_ratings_dashboard,
+    render_ticker_brand_badge,
     save_or_update_option_position,
 )
 
@@ -111,6 +114,13 @@ if ticker_input:
         st.error(err)
     else:
         current_p = data["current_price"]
+
+        brand_data = get_stock_branding_and_ratings(data["ticker"])
+        st.html(render_ticker_brand_badge(data["ticker"], cur_p=current_p, brand_data=brand_data))
+
+        with st.expander("📊 Wall Street Analyst Rating & Technical Intelligence", expanded=True):
+            render_analyst_ratings_dashboard(data["ticker"], brand_data=brand_data)
+
         available_exps = fetch_option_expirations(data["ticker"])
 
         if not available_exps:

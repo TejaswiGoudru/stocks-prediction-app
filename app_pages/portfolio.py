@@ -11,6 +11,7 @@ from utils import (
     load_portfolio,
     mask_mongo_uri,
     migrate_json_to_mongo,
+    render_analyst_ratings_dashboard,
     save_mongo_config,
     test_mongo_connection,
     update_portfolio_position,
@@ -526,6 +527,7 @@ else:
                 <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
                     <div>
                         <div style="display:flex; align-items:center; gap:10px;">
+                            <img src="https://assets.parqet.com/logos/symbol/{t}?format=png" onerror="this.style.display='none'" style="width:32px; height:32px; border-radius:8px; border:1px solid #e2e8f0; background:#ffffff; padding:2px; object-fit:contain; box-shadow:0 1px 2px rgba(0,0,0,0.05);" alt="{t} logo" />
                             <span style="font-size:22px; font-weight:800; color:#1e293b;">{t}</span>
                             <span style="background:{badge_bg}; color:{badge_txt}; border:1px solid {badge_border}; font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; text-transform:uppercase;">{strategy_label}</span>
                         </div>
@@ -588,6 +590,9 @@ else:
                     delete_portfolio_position(pos["id"])
                     st.toast(f"Removed {t} from portfolio.", icon="🗑️")
                     st.rerun()
+
+            with st.expander(f"📊 Wall Street Analyst Rating & Technical Intelligence for {t}"):
+                render_analyst_ratings_dashboard(t)
 
             # Optional: In-place edit expander for this stock's active options
             with st.expander(f"⚙️ Quick Edit Active Options for {t}"):

@@ -11,7 +11,10 @@ from utils import (
     fetch_option_expirations,
     fetch_stock_forecast,
     fetch_walletinvestor_data,
+    get_stock_branding_and_ratings,
     load_portfolio,
+    render_analyst_ratings_dashboard,
+    render_ticker_brand_badge,
     save_or_update_option_position,
 )
 
@@ -152,6 +155,12 @@ if ticker_input:
             help="1 option contract covers 100 shares of stock.",
         )
         st.session_state.cc_contracts = contracts_qty
+
+    brand_data = get_stock_branding_and_ratings(data["ticker"])
+    st.html(render_ticker_brand_badge(data["ticker"], cur_p=current_p, brand_data=brand_data))
+
+    with st.expander("📊 Wall Street Analyst Rating & Technical Intelligence", expanded=True):
+        render_analyst_ratings_dashboard(data["ticker"], brand_data=brand_data)
 
     # ---------------------------------------------------------
     # SECTION 2: COVERED CALL OPTION SELECTION

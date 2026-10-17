@@ -3,7 +3,14 @@ import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 from dateutil.relativedelta import relativedelta
-from utils import COMMON_CSS, fetch_stock_forecast, fetch_walletinvestor_data
+from utils import (
+    COMMON_CSS,
+    fetch_stock_forecast,
+    fetch_walletinvestor_data,
+    get_stock_branding_and_ratings,
+    render_analyst_ratings_dashboard,
+    render_ticker_brand_badge,
+)
 
 st.html(COMMON_CSS)
 
@@ -26,11 +33,17 @@ with col_input:
 ticker_input = st.session_state.ticker
 
 if ticker_input:
+    brand_data = get_stock_branding_and_ratings(ticker_input)
+    st.html(render_ticker_brand_badge(ticker_input, brand_data=brand_data))
+
+    # Render Wall Street Analyst Rating, Technical Summary & Market Performance
+    render_analyst_ratings_dashboard(ticker_input, brand_data=brand_data)
+
     data, err = fetch_stock_forecast(ticker_input)
     if err:
         st.error(err)
     else:
-        st.markdown(f"## **{data['ticker']} Forecasts**")
+        st.markdown(f"### **Interactive Chart & Scenario Forecasts**")
         col_left, col_right = st.columns([1, 2], gap="large")
 
         # ---------------------------------------------------------
