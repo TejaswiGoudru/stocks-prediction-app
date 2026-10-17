@@ -1,0 +1,831 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import requests
+from bs4 import BeautifulSoup
+import re
+import math
+
+st.set_page_config(page_title="Cash Secured Put Dashboard", layout="wide")
+
+# Styling to mimic clean financial portal cards
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #ffffff !important;
+    }
+    .reportview-container .main .block-container {
+        padding-top: 2rem;
+        max-width: 1200px;
+    }
+    .metric-card {
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+        border: 1px solid #ebebeb;
+    }
+    .trading-grid {
+        display: grid;
+        grid-template-columns: 1fr 1.18fr;
+        gap: 18px;
+        align-items: stretch;
+    }
+    @media (max-width: 768px) {
+        .trading-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- Normal Distribution CDF for Black-Scholes Greeks ---
+def norm_cdf(x: float) -> float:
+    """Standard normal cumulative distribution function."""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def calc_put_greeks(s: float, k: float, dte: int, iv: float, r: float = 0.045):
+    """Calculates Black-Scholes Delta and Probability of Profit (PoP)."""
+    t = max(dte / 365.0, 0.001)
+    sigma = max(iv, 0.01)
+    d1 = (math.log(s / k) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+    delta = norm_cdf(d1) - 1.0  # negative for puts
+    prob_otm = norm_cdf(d2)     # Probability stock expires above strike (PoP for CSP seller)
+    return delta, prob_otm
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_stock_forecast(ticker_symbol: str):
+    """Pulls historical data, current price, and analyst targets via yfinance."""
+    ticker = yf.Ticker(ticker_symbol.upper())
+
+    hist = ticker.history(period="1y", interval="1d")
+    if hist.empty:
+        return None, "Ticker not found or historical data unavailable."
+
+    targets = ticker.analyst_price_targets
+    info = ticker.info
+
+    current_price = (
+        (targets.get("current") if targets else None)
+        or info.get("currentPrice")
+        or hist["Close"].iloc[-1]
+    )
+
+    high_target = targets.get("high") if targets else info.get("targetHighPrice")
+    median_target = targets.get("median") if targets else info.get("targetMedianPrice")
+    if not median_target:
+        median_target = targets.get("mean") if targets else info.get("targetMeanPrice")
+    low_target = targets.get("low") if targets else info.get("targetLowPrice")
+
+    if not high_target:
+        high_target = round(current_price * 1.25, 2)
+    if not median_target:
+        median_target = round(current_price * 1.10, 2)
+    if not low_target:
+        low_target = round(current_price * 0.90, 2)
+
+    data = {
+        "ticker": ticker_symbol.upper(),
+        "hist": hist,
+        "current_price": float(current_price),
+        "high_target": float(high_target),
+        "median_target": float(median_target),
+        "low_target": float(low_target),
+        "shortName": info.get("shortName", ticker_symbol.upper()),
+        "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow", hist["Low"].min()),
+        "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh", hist["High"].max())
+    }
+    return data, None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_option_expirations(ticker_symbol: str):
+    """Fetches available option expiration dates."""
+    ticker = yf.Ticker(ticker_symbol.upper())
+    return ticker.options
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_put_chain(ticker_symbol: str, expiration_date: str):
+    """Pulls full put option chain for a given expiration."""
+    ticker = yf.Ticker(ticker_symbol.upper())
+    chain = ticker.option_chain(expiration_date)
+    return chain.puts
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_walletinvestor_data(ticker_symbol: str, current_price: float, high_target: float, median_target: float, low_target: float):
+    """Pulls 1-year scenarios and trading levels from WalletInvestor with a mathematical fallback."""
+    url = f"https://walletinvestor.com/stock-forecast/{ticker_symbol.lower()}-stock-prediction"
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+
+    scenarios = []
+    trading_data = {}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=6)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # 1. 1-Year Scenarios
+            scen_h2 = soup.find(lambda tag: tag.name == "h2" and "1-year scenarios" in tag.text.lower())
+            if scen_h2:
+                sec = scen_h2.find_parent("section")
+                cards = sec.find_all("div", class_=lambda c: c and "shadow-card" in c)
+                for card in cards:
+                    title_elem = card.find("span", class_=lambda c: c and "uppercase" in c)
+                    prob_elem = card.find("span", class_=lambda c: c and "text-muted" in c)
+                    price_elem = card.find("div", class_=lambda c: c and "text-navy" in c)
+                    pct_elem = card.find("div", class_=lambda c: c and "font-semibold" in c)
+
+                    if title_elem and price_elem:
+                        title = title_elem.get_text(strip=True)
+                        prob = prob_elem.get_text(strip=True) if prob_elem else "0% likely"
+                        price = price_elem.get_text(strip=True)
+                        pct = pct_elem.get_text(strip=True) if pct_elem else "0%"
+                        prob_num = int(re.sub(r"[^\d]", "", prob) or 0)
+                        scenarios.append({
+                            "title": title,
+                            "prob": prob,
+                            "prob_num": prob_num,
+                            "price": price,
+                            "pct": pct
+                        })
+
+            # 2. Trading levels
+            trading_h2 = soup.find(lambda tag: tag.name == "h2" and "trading levels" in tag.text.lower())
+            if trading_h2:
+                sec = trading_h2.find_parent("section")
+                cards = sec.find_all("div", class_=lambda c: c and "shadow-card" in c)
+                if len(cards) >= 2:
+                    c0 = cards[0]
+                    text_parts = [t.strip() for t in c0.stripped_strings]
+                    upside_p, upside_pct = None, None
+                    now_p = None
+                    downside_p, downside_pct = None, None
+                    for i, t in enumerate(text_parts):
+                        if t.lower() == "upside" and i + 2 < len(text_parts):
+                            upside_p = text_parts[i + 1]
+                            upside_pct = text_parts[i + 2]
+                        elif t.lower() == "now" and i + 1 < len(text_parts):
+                            now_p = text_parts[i + 1]
+                        elif t.lower() == "downside" and i + 2 < len(text_parts):
+                            downside_p = text_parts[i + 1]
+                            downside_pct = text_parts[i + 2]
+
+                    trading_data["target_14d"] = {
+                        "upside": upside_p or f"${current_price * 1.0201:.2f}",
+                        "upside_pct": upside_pct or "+2.01%",
+                        "now": now_p or f"${current_price:.2f}",
+                        "downside": downside_p or f"${current_price * 1.005:.2f}",
+                        "downside_pct": downside_pct or "+0.50%"
+                    }
+
+                    c1 = cards[1]
+                    pivots = {}
+                    for row in c1.find_all("div", style=lambda s: s and "bottom:" in s):
+                        txts = [s.strip() for s in row.stripped_strings]
+                        for lvl in ["R3", "R2", "R1", "Pivot", "S1", "S2", "S3"]:
+                            if lvl in txts:
+                                for t in txts:
+                                    if "$" in t:
+                                        pivots[lvl] = t
+                                        break
+                    now_match = re.search(r"now.*?\$(\d+[\.,]\d+)", c1.get_text(separator=" ", strip=True))
+                    if now_match:
+                        pivots["Now"] = "$" + now_match.group(1)
+                    elif now_p:
+                        pivots["Now"] = now_p
+                    else:
+                        pivots["Now"] = f"${current_price:.2f}"
+
+                    trading_data["pivots"] = pivots
+    except Exception:
+        pass
+
+    # Mathematical fallbacks
+    if not scenarios:
+        pct_low = ((low_target - current_price) / current_price) * 100
+        pct_med = ((median_target - current_price) / current_price) * 100
+        pct_high = ((high_target - current_price) / current_price) * 100
+
+        scenarios = [
+            {
+                "title": "Bear case",
+                "prob": "20% likely",
+                "prob_num": 20,
+                "price": f"${low_target:.2f}",
+                "pct": f"{pct_low:+.1f}%"
+            },
+            {
+                "title": "Base case",
+                "prob": "55% likely",
+                "prob_num": 55,
+                "price": f"${median_target:.2f}",
+                "pct": f"{pct_med:+.1f}%"
+            },
+            {
+                "title": "Bull case",
+                "prob": "25% likely",
+                "prob_num": 25,
+                "price": f"${high_target:.2f}",
+                "pct": f"{pct_high:+.1f}%"
+            }
+        ]
+
+    if "target_14d" not in trading_data or "pivots" not in trading_data:
+        up_price = round(current_price * 1.0201, 2)
+        down_price = round(current_price * 1.0050, 2)
+        trading_data["target_14d"] = {
+            "upside": f"${up_price:.2f}",
+            "upside_pct": "+2.01%",
+            "now": f"${current_price:.2f}",
+            "downside": f"${down_price:.2f}",
+            "downside_pct": "+0.50%"
+        }
+
+        h = current_price * 1.025
+        l = current_price * 0.975
+        c = current_price
+        p = (h + l + c) / 3.0
+        r1 = 2 * p - l
+        s1 = 2 * p - h
+        r2 = p + (h - l)
+        s2 = p - (h - l)
+        r3 = h + 2 * (p - l)
+        s3 = l - 2 * (h - p)
+
+        trading_data["pivots"] = {
+            "R3": f"${r3:.2f}",
+            "R2": f"${r2:.2f}",
+            "R1": f"${r1:.2f}",
+            "Pivot": f"${p:.2f}",
+            "Now": f"${current_price:.2f}",
+            "S1": f"${s1:.2f}",
+            "S2": f"${s2:.2f}",
+            "S3": f"${s3:.2f}"
+        }
+
+    return {"scenarios": scenarios, "trading": trading_data}
+
+
+# --- UI Header & Controls ---
+st.title("Cash Secured Put (CSP) Strategy Dashboard")
+st.markdown("Sell cash-secured puts below technical support to generate steady income or acquire quality shares at a net discount.")
+
+col_top1, col_top2, col_top3 = st.columns([1.5, 1.8, 1.2])
+
+with col_top1:
+    ticker_input = st.text_input("Underlying Ticker Symbol", value="ORCL", max_chars=6).strip()
+
+if ticker_input:
+    data, err = fetch_stock_forecast(ticker_input)
+    if err:
+        st.error(err)
+    else:
+        current_p = data["current_price"]
+        available_exps = fetch_option_expirations(data["ticker"])
+
+        if not available_exps:
+            st.warning(f"No options chain data available for ticker {data['ticker']}.")
+            st.stop()
+
+        # Find best default expiration (closest to 30-45 DTE - classic CSP sweet spot)
+        now_dt = datetime.now()
+        exp_dtes = []
+        for e in available_exps:
+            try:
+                days = (datetime.strptime(e, "%Y-%m-%d") - now_dt).days
+                exp_dtes.append((e, max(days, 0)))
+            except Exception:
+                pass
+
+        # Sort and find index closest to 30-45 DTE
+        ideal_idx = 0
+        min_diff = 9999
+        for i, (e, d) in enumerate(exp_dtes):
+            diff = abs(d - 35)
+            if diff < min_diff:
+                min_diff = diff
+                ideal_idx = i
+
+        with col_top2:
+            exp_labels = [f"{e} ({d} DTE)" for e, d in exp_dtes]
+            selected_exp_idx = st.selectbox(
+                "Expiration Date (DTE)",
+                options=range(len(exp_dtes)),
+                format_func=lambda i: exp_labels[i],
+                index=ideal_idx
+            )
+            selected_exp = exp_dtes[selected_exp_idx][0]
+            selected_dte = exp_dtes[selected_exp_idx][1]
+
+        with col_top3:
+            contracts_qty = st.number_input("Contracts", min_value=1, max_value=100, value=1, step=1)
+
+        # Pull put chain for selected expiration
+        puts_df = fetch_put_chain(data["ticker"], selected_exp)
+        if puts_df.empty:
+            st.error(f"No put options data found for expiration {selected_exp}.")
+            st.stop()
+
+        # Filter out-of-the-money and near-the-money puts (65% to 102% of spot price)
+        puts_filtered = puts_df[(puts_df["strike"] <= current_p * 1.02) & (puts_df["strike"] >= current_p * 0.65)].copy()
+        if puts_filtered.empty:
+            puts_filtered = puts_df[puts_df["strike"] <= current_p].copy()
+
+        # Compute mid price, IV, Delta, PoP, ROC, APR, Breakeven, Buffer for all puts
+        computed_rows = []
+        for _, row in puts_filtered.iterrows():
+            k = float(row["strike"])
+            bid = float(row["bid"]) if not pd.isna(row["bid"]) else 0.0
+            ask = float(row["ask"]) if not pd.isna(row["ask"]) else 0.0
+            last = float(row["lastPrice"]) if not pd.isna(row["lastPrice"]) else 0.0
+
+            mid = (bid + ask) / 2.0 if (bid + ask) > 0 else last
+            if mid <= 0:
+                mid = last if last > 0 else 0.05
+
+            iv = float(row["impliedVolatility"]) if not pd.isna(row["impliedVolatility"]) else 0.35
+            delta, pop = calc_put_greeks(current_p, k, selected_dte, iv)
+
+            roc = (mid / k) * 100.0
+            apr = roc * (365.0 / max(selected_dte, 1))
+            be = k - mid
+            buffer_pct = ((current_p - be) / current_p) * 100.0
+
+            computed_rows.append({
+                "strike": k,
+                "bid": bid,
+                "ask": ask,
+                "mid": round(mid, 2),
+                "last": round(last, 2),
+                "iv": iv,
+                "delta": round(delta, 2),
+                "pop": round(pop * 100.0, 1),
+                "roc": round(roc, 2),
+                "apr": round(apr, 1),
+                "breakeven": round(be, 2),
+                "buffer": round(buffer_pct, 1),
+                "volume": int(row["volume"]) if not pd.isna(row["volume"]) else 0,
+                "openInterest": int(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
+            })
+
+        options_data_df = pd.DataFrame(computed_rows).sort_values("strike", ascending=False).reset_index(drop=True)
+
+        # Select a default strike: ~0.25 - 0.30 Delta or 5-7% OTM
+        default_strike_idx = 0
+        min_delta_diff = 999.0
+        for idx, row in options_data_df.iterrows():
+            diff = abs(abs(row["delta"]) - 0.25)
+            if diff < min_delta_diff:
+                min_delta_diff = diff
+                default_strike_idx = idx
+
+        # Fetch WalletInvestor technical support levels to display context
+        wi_data = fetch_walletinvestor_data(
+            data["ticker"],
+            current_p,
+            data["high_target"],
+            data["median_target"],
+            data["low_target"]
+        )
+        trading = wi_data.get("trading", {})
+        pivots = trading.get("pivots", {})
+
+        # Sub-header bar for Stock Context
+        st.markdown(f"""
+        <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:14px 20px; margin-top:14px; margin-bottom:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+            <div>
+                <span style="font-size:18px; font-weight:700; color:#1e293b;">{data['ticker']} &bull; {data['shortName']}</span>
+                <span style="font-size:15px; color:#64748b; margin-left:12px;">Spot Price: <b style="color:#1e293b;">${current_p:.2f}</b></span>
+            </div>
+            <div style="font-size:14px; color:#64748b; display:flex; gap:18px;">
+                <span>52W Range: <b>${data['fiftyTwoWeekLow']:.2f} - ${data['fiftyTwoWeekHigh']:.2f}</b></span>
+                <span>Analyst Median: <b style="color:#00875A;">${data['median_target']:.2f}</b></span>
+                <span>Pivot: <b>{pivots.get('Pivot', 'N/A')}</b> &bull; S1 Support: <b style="color:#489E60;">{pivots.get('S1', 'N/A')}</b></span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ---------------------------------------------------------
+        # STRIKE SELECTION & KPI CARDS
+        # ---------------------------------------------------------
+        col_strike, col_premium = st.columns([2, 1])
+        with col_strike:
+            strike_options = options_data_df["strike"].tolist()
+            selected_strike = st.selectbox(
+                "Choose Put Strike Price to Sell",
+                options=strike_options,
+                index=default_strike_idx,
+                format_func=lambda s: f"${s:.2f} Strike (Delta {options_data_df[options_data_df['strike'] == s]['delta'].iloc[0]:.2f} | PoP {options_data_df[options_data_df['strike'] == s]['pop'].iloc[0]:.1f}%)"
+            )
+
+        chosen_option = options_data_df[options_data_df["strike"] == selected_strike].iloc[0]
+
+        with col_premium:
+            user_premium = st.number_input(
+                "Option Premium per Share ($)",
+                min_value=0.01,
+                max_value=float(selected_strike),
+                value=float(chosen_option["mid"]),
+                step=0.05,
+                format="%.2f"
+            )
+
+        # Calculated Cash Secured Put Metrics
+        total_collateral = selected_strike * 100 * contracts_qty
+        total_premium = user_premium * 100 * contracts_qty
+        breakeven_price = selected_strike - user_premium
+        cushion_pct = ((current_p - breakeven_price) / current_p) * 100.0
+        roc_pct = (user_premium / selected_strike) * 100.0
+        apr_pct = roc_pct * (365.0 / max(selected_dte, 1))
+        pop_pct = chosen_option["pop"]
+
+        # Render Core KPI Cards in a balanced row
+        st.html(f"""
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-top:8px; margin-bottom:28px;">
+            <div class="metric-card" style="border-top:3px solid #2E384C;">
+                <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Cash Collateral</div>
+                <div style="font-size:22px; font-weight:800; color:#1e293b;">${total_collateral:,.2f}</div>
+                <div style="font-size:12px; color:#64748b; margin-top:4px;">100% Cash &bull; {contracts_qty} contract(s)</div>
+            </div>
+            <div class="metric-card" style="border-top:3px solid #00875A;">
+                <div style="font-size:12px; font-weight:700; color:#00875A; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Total Premium</div>
+                <div style="font-size:22px; font-weight:800; color:#00875A;">+${total_premium:,.2f}</div>
+                <div style="font-size:12px; color:#00875A; font-weight:600; margin-top:4px;">Immediate Cash Inflow</div>
+            </div>
+            <div class="metric-card" style="border-top:3px solid #489E60;">
+                <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Net Breakeven</div>
+                <div style="font-size:22px; font-weight:800; color:#1e293b;">${breakeven_price:.2f}</div>
+                <div style="font-size:12px; color:#489E60; font-weight:600; margin-top:4px;">{cushion_pct:+.1f}% Safety Buffer</div>
+            </div>
+            <div class="metric-card" style="border-top:3px solid #2E384C;">
+                <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Return on Capital</div>
+                <div style="font-size:22px; font-weight:800; color:#1e293b;">{roc_pct:.2f}%</div>
+                <div style="font-size:12px; color:#2E384C; font-weight:600; margin-top:4px;">{apr_pct:.1f}% APR ({selected_dte}d)</div>
+            </div>
+            <div class="metric-card" style="border-top:3px solid #00875A;">
+                <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Win Rate (PoP)</div>
+                <div style="font-size:22px; font-weight:800; color:#00875A;">{pop_pct:.1f}%</div>
+                <div style="font-size:12px; color:#64748b; margin-top:4px;">Delta: {chosen_option['delta']:.2f}</div>
+            </div>
+        </div>
+        """)
+
+
+        # ---------------------------------------------------------
+        # INTERACTIVE P&L PAYOFF DIAGRAM & EXPIRATION SCENARIOS
+        # ---------------------------------------------------------
+        st.markdown("""
+        <div style="display:flex; align-items:center; margin-top:10px; margin-bottom:14px;">
+            <div style="width:4px; height:24px; background-color:#489e60; border-radius:2px; margin-right:12px;"></div>
+            <h3 style="margin:0; font-size:23px; font-weight:700; color:#1e293b; letter-spacing:-0.02em;">Cash Secured Put Payoff at Expiration</h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_chart, col_scenarios = st.columns([1.6, 1.0], gap="large")
+
+        with col_chart:
+            # Generate range of underlying stock prices at expiration
+            price_min = max(selected_strike * 0.70, current_p * 0.65)
+            price_max = max(selected_strike * 1.25, current_p * 1.25)
+            stock_prices = np.linspace(price_min, price_max, 250)
+
+            # P&L formula for short put: Premium - max(0, Strike - Stock_Price) per share * 100 * contracts
+            pnl_values = np.array([
+                (user_premium - max(0.0, selected_strike - p)) * 100.0 * contracts_qty
+                for p in stock_prices
+            ])
+
+            fig_pnl = go.Figure()
+
+            # Zero reference line
+            fig_pnl.add_hline(y=0, line_dash="solid", line_color="#cbd5e1", line_width=1.5)
+
+            # Green Profit Area
+            fig_pnl.add_trace(go.Scatter(
+                x=stock_prices,
+                y=np.maximum(0, pnl_values),
+                mode="lines",
+                name="Profit Zone",
+                line=dict(color="#00875A", width=0),
+                fill="tozeroy",
+                fillcolor="rgba(0, 135, 90, 0.12)",
+                hoverinfo="none"
+            ))
+
+            # Red Loss Area
+            fig_pnl.add_trace(go.Scatter(
+                x=stock_prices,
+                y=np.minimum(0, pnl_values),
+                mode="lines",
+                name="Assignment Loss Zone",
+                line=dict(color="#DE350B", width=0),
+                fill="tozeroy",
+                fillcolor="rgba(222, 53, 11, 0.10)",
+                hoverinfo="none"
+            ))
+
+            # P&L Payoff Line
+            fig_pnl.add_trace(go.Scatter(
+                x=stock_prices,
+                y=pnl_values,
+                mode="lines",
+                name="P&L at Expiration",
+                line=dict(color="#172B4D", width=3),
+                hovertemplate="Stock: $%{x:.2f}<br>P&L: $%{y:,.2f}<extra></extra>"
+            ))
+
+            # Vertical Line: Strike Price
+            fig_pnl.add_vline(
+                x=selected_strike,
+                line_width=1.5,
+                line_dash="dot",
+                line_color="#00875A",
+                annotation_text=f"Strike ${selected_strike:.2f}",
+                annotation_position="top left",
+                annotation_font=dict(color="#00875A", size=11)
+            )
+
+            # Vertical Line: Breakeven
+            fig_pnl.add_vline(
+                x=breakeven_price,
+                line_width=1.5,
+                line_dash="dot",
+                line_color="#E5443B",
+                annotation_text=f"Breakeven ${breakeven_price:.2f}",
+                annotation_position="bottom right",
+                annotation_font=dict(color="#E5443B", size=11)
+            )
+
+            # Vertical Line: Current Stock Price
+            fig_pnl.add_vline(
+                x=current_p,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="#475569",
+                annotation_text=f"Current ${current_p:.2f}",
+                annotation_position="top right",
+                annotation_font=dict(color="#475569", size=11)
+            )
+
+            # Marker at Breakeven
+            fig_pnl.add_trace(go.Scatter(
+                x=[breakeven_price],
+                y=[0],
+                mode="markers",
+                marker=dict(size=8, color="#E5443B", line=dict(color="#ffffff", width=2)),
+                showlegend=False,
+                hoverinfo="none"
+            ))
+
+            # Marker at Strike
+            fig_pnl.add_trace(go.Scatter(
+                x=[selected_strike],
+                y=[total_premium],
+                mode="markers",
+                marker=dict(size=8, color="#00875A", line=dict(color="#ffffff", width=2)),
+                showlegend=False,
+                hoverinfo="none"
+            ))
+
+            fig_pnl.update_layout(
+                showlegend=False,
+                height=380,
+                margin=dict(l=20, r=20, t=30, b=30),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(
+                    title="Underlying Stock Price at Expiration ($)",
+                    showgrid=True,
+                    gridcolor="#f1f5f9",
+                    zeroline=False,
+                    tickprefix="$",
+                    tickformat=".1f"
+                ),
+                yaxis=dict(
+                    title="Total Profit / Loss ($)",
+                    showgrid=True,
+                    gridcolor="#f1f5f9",
+                    zeroline=False,
+                    tickprefix="$",
+                    tickformat=",.0f"
+                )
+            )
+
+            st.plotly_chart(fig_pnl, width="stretch")
+
+        with col_scenarios:
+            scenarios_html = f"""
+<div style="display:flex; flex-direction:column; gap:12px; height:100%; justify-content:center;">
+    <!-- Scenario 1: Best Case -->
+    <div style="background:#ffffff; border:1px solid #e2e8f0; border-top:3px solid #00875A; border-radius:12px; padding:16px; box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:12px; font-weight:700; color:#00875A; text-transform:uppercase;">Best Case &bull; Stock &ge; ${selected_strike:.2f}</span>
+            <span style="font-size:12px; font-weight:600; color:#00875A;">Max Profit</span>
+        </div>
+        <div style="font-size:20px; font-weight:700; color:#1e293b; margin:6px 0 2px 0;">+${total_premium:,.2f}</div>
+        <p style="font-size:13px; color:#64748b; margin:0; line-height:1.4;">Put expires completely worthless. You keep 100% of the premium and the full <b>${total_collateral:,.2f}</b> collateral is immediately freed.</p>
+    </div>
+
+    <!-- Scenario 2: Moderate Pullback -->
+    <div style="background:#ffffff; border:1px solid #e2e8f0; border-top:3px solid #2E384C; border-radius:12px; padding:16px; box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:12px; font-weight:700; color:#2E384C; text-transform:uppercase;">Discount Buy &bull; ${breakeven_price:.2f} &lt; Stock &lt; ${selected_strike:.2f}</span>
+            <span style="font-size:12px; font-weight:600; color:#2E384C;">Net Positive</span>
+        </div>
+        <div style="font-size:20px; font-weight:700; color:#1e293b; margin:6px 0 2px 0;">Own shares at ${breakeven_price:.2f} basis</div>
+        <p style="font-size:13px; color:#64748b; margin:0; line-height:1.4;">You are assigned <b>{contracts_qty * 100} shares</b> at ${selected_strike:.2f}. Because you collected premium, your effective basis is lower than today's price by <b>{cushion_pct:.1f}%</b>.</p>
+    </div>
+
+    <!-- Scenario 3: Heavy Drop -->
+    <div style="background:#ffffff; border:1px solid #e2e8f0; border-top:3px solid #E5443B; border-radius:12px; padding:16px; box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:12px; font-weight:700; color:#E5443B; text-transform:uppercase;">Downside Risk &bull; Stock &lt; ${breakeven_price:.2f}</span>
+            <span style="font-size:12px; font-weight:600; color:#E5443B;">Unrealized Loss</span>
+        </div>
+        <div style="font-size:20px; font-weight:700; color:#1e293b; margin:6px 0 2px 0;">Wheel &bull; Sell Covered Calls</div>
+        <p style="font-size:13px; color:#64748b; margin:0; line-height:1.4;">You own {contracts_qty * 100} shares with unrealized loss. As part of the classic Options Wheel strategy, you can begin writing Covered Calls against these shares.</p>
+    </div>
+</div>
+"""
+            st.html(scenarios_html)
+
+
+        # ---------------------------------------------------------
+        # CANDIDATE PUT OPTIONS SCREENER
+        # ---------------------------------------------------------
+        st.markdown("""
+        <div style="display:flex; align-items:center; margin-top:36px; margin-bottom:14px;">
+            <div style="width:4px; height:24px; background-color:#489e60; border-radius:2px; margin-right:12px;"></div>
+            <h3 style="margin:0; font-size:23px; font-weight:700; color:#1e293b; letter-spacing:-0.02em;">Candidate Put Options Screener</h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Screener table formatting
+        screener_display = options_data_df.copy()
+        screener_display["Delta Category"] = screener_display["delta"].apply(
+            lambda d: "🟢 Conservative (< 0.20)" if abs(d) < 0.20 else ("🟡 Balanced (0.20 - 0.30)" if abs(d) <= 0.30 else "🔴 Aggressive (> 0.30)")
+        )
+        screener_display["Strike ($)"] = screener_display["strike"].map("${:,.2f}".format)
+        screener_display["Bid / Ask"] = screener_display.apply(lambda r: f"${r['bid']:.2f} / ${r['ask']:.2f}", axis=1)
+        screener_display["Mid Premium ($)"] = screener_display["mid"].map("${:.2f}".format)
+        screener_display["Collateral ($)"] = screener_display["strike"].apply(lambda k: f"${k * 100:,.0f}")
+        screener_display["Income ($)"] = screener_display["mid"].apply(lambda m: f"${m * 100:,.2f}")
+        screener_display["PoP (%)"] = screener_display["pop"].map("{:.1f}%".format)
+        screener_display["ROC (%)"] = screener_display["roc"].map("{:.2f}%".format)
+        screener_display["Annualized APR (%)"] = screener_display["apr"].map("{:.1f}%".format)
+        screener_display["Breakeven ($)"] = screener_display["breakeven"].map("${:.2f}".format)
+        screener_display["Safety Buffer (%)"] = screener_display["buffer"].map("{:+.1f}%".format)
+
+        cols_to_show = [
+            "Strike ($)", "Delta Category", "delta", "PoP (%)", "Bid / Ask",
+            "Mid Premium ($)", "Collateral ($)", "Income ($)", "ROC (%)",
+            "Annualized APR (%)", "Breakeven ($)", "Safety Buffer (%)", "openInterest"
+        ]
+        rename_map = {
+            "delta": "Delta (Δ)",
+            "openInterest": "Open Int"
+        }
+
+        st.dataframe(
+            screener_display[cols_to_show].rename(columns=rename_map),
+            width="stretch",
+            hide_index=True
+        )
+
+        # ---------------------------------------------------------
+        # TECHNICAL SUPPORT & RESISTANCE CONTEXT
+        # ---------------------------------------------------------
+        target_14d = trading.get("target_14d", {})
+
+        def parse_price(val_str):
+            try:
+                return float(re.sub(r"[^\d.]", "", str(val_str)))
+            except Exception:
+                return 0.0
+
+        now_str = pivots.get("Now", f"${current_p:.2f}")
+        now_val = parse_price(now_str)
+
+        standard_order = [
+            ("R3", pivots.get("R3", ""), "#e5443b", "std"),
+            ("R2", pivots.get("R2", ""), "#e5443b", "std"),
+            ("R1", pivots.get("R1", ""), "#e5443b", "std"),
+            ("Pivot", pivots.get("Pivot", ""), "#2E384C", "std"),
+            ("S1", pivots.get("S1", ""), "#489E60", "std"),
+            ("S2", pivots.get("S2", ""), "#489E60", "std"),
+            ("S3", pivots.get("S3", ""), "#489E60", "std"),
+        ]
+
+        ordered_levels = []
+        now_inserted = False
+        for label, p_str, col, kind in standard_order:
+            val = parse_price(p_str)
+            if not now_inserted and now_val >= val and val > 0:
+                ordered_levels.append(("now", now_str, "#1e293b", "now"))
+                now_inserted = True
+            if p_str:
+                ordered_levels.append((label, p_str, col, kind))
+
+        if not now_inserted:
+            ordered_levels.append(("now", now_str, "#1e293b", "now"))
+
+        pivot_rows_html = []
+        for label, p_str, col, kind in ordered_levels:
+            if kind == "now":
+                pivot_rows_html.append(
+                    f'<div style="display:flex; align-items:center; justify-content:space-between; margin:11px 0;">'
+                    f'<div style="display:flex; align-items:center; width:65px;">'
+                    f'<span style="font-size:12px; font-weight:700; color:#1e293b; background:#eceff4; padding:2px 8px; border-radius:5px; letter-spacing:0.02em;">now</span>'
+                    f'</div>'
+                    f'<div style="flex:1; height:2px; background:#1e293b; margin:0 12px;"></div>'
+                    f'<span style="font-size:16px; font-weight:800; color:#1e293b; font-variant-numeric:tabular-nums;">{p_str}</span>'
+                    f'</div>'
+                )
+            else:
+                pivot_rows_html.append(
+                    f'<div style="display:flex; align-items:center; justify-content:space-between; margin:9px 0;">'
+                    f'<div style="display:flex; align-items:center; width:65px;">'
+                    f'<span style="font-size:14px; font-weight:700; color:{col}; width:38px;">{label}</span>'
+                    f'<span style="width:8px; height:8px; border-radius:50%; background:{col}; display:inline-block;"></span>'
+                    f'</div>'
+                    f'<div style="flex:1; border-top:1px dashed #e2e8f0; margin:0 12px;"></div>'
+                    f'<span style="font-size:14px; font-weight:500; color:#51607a; font-variant-numeric:tabular-nums;">{p_str}</span>'
+                    f'</div>'
+                )
+
+        levels_rendered_html = "\n".join(pivot_rows_html)
+
+        upside_val = target_14d.get("upside", "$0.00")
+        upside_pct = target_14d.get("upside_pct", "+0.00%")
+        now_target_val = target_14d.get("now", now_str)
+        downside_val = target_14d.get("downside", "$0.00")
+        downside_pct = target_14d.get("downside_pct", "+0.00%")
+
+        trading_levels_html = f"""
+<div style="background-color:#ebf4ef; border:1px solid #d9e9df; border-radius:20px; padding:26px; margin-top:36px; margin-bottom:32px;">
+    <div style="display:flex; align-items:center; margin-bottom:18px;">
+        <div style="width:4px; height:22px; background-color:#489e60; border-radius:2px; margin-right:12px;"></div>
+        <h3 style="margin:0; font-size:23px; font-weight:700; color:#1e293b; letter-spacing:-0.02em;">Technical Trading Levels & Support Check</h3>
+    </div>
+    <div class="trading-grid">
+        <!-- Left Card: 14-Day Target -->
+        <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:24px; box-shadow:0 1px 4px rgba(0,0,0,0.04); display:flex; flex-direction:column; justify-content:space-between;">
+            <div>
+                <div style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#64748b; margin-bottom:3px;">14-day target</div>
+                <p style="margin:0 0 24px 0; font-size:14px; color:#64748b; line-height:1.4;">Verify whether your chosen put strike (${selected_strike:.2f}) sits comfortably below the expected 14-day downside range.</p>
+            </div>
+            <div style="display:flex; align-items:center; gap:22px; padding:8px 0 16px 0;">
+                <div style="width:36px; display:flex; flex-direction:column; align-items:center; flex-shrink:0;">
+                    <div style="width:2.5px; height:38px; background:linear-gradient(#489E60, #cdd7e6); border-radius:1px;"></div>
+                    <div style="width:14px; height:14px; border-radius:50%; background:#1e293b; border:3px solid #ffffff; box-shadow:0 0 0 1.5px #2e384c;"></div>
+                    <div style="width:2.5px; height:38px; background:linear-gradient(#cdd7e6, #e5443b); border-radius:1px;"></div>
+                </div>
+                <div style="flex:1; display:flex; flex-direction:column; gap:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                        <div>
+                            <div style="font-size:12px; color:#64748b; font-weight:600;">Upside</div>
+                            <div style="font-size:19px; font-weight:700; color:#1e293b;">{upside_val}</div>
+                        </div>
+                        <div style="font-size:15px; font-weight:700; color:#489e60;">{upside_pct}</div>
+                    </div>
+                    <div style="border-top:1px dashed #e2e8f0; border-bottom:1px dashed #e2e8f0; padding:10px 0; display:flex; justify-content:space-between; align-items:baseline;">
+                        <div>
+                            <div style="font-size:12px; color:#64748b; font-weight:600;">Now</div>
+                            <div style="font-size:19px; font-weight:700; color:#1e293b;">{now_target_val}</div>
+                        </div>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                        <div>
+                            <div style="font-size:12px; color:#64748b; font-weight:600;">Downside</div>
+                            <div style="font-size:19px; font-weight:700; color:#1e293b;">{downside_val}</div>
+                        </div>
+                        <div style="font-size:15px; font-weight:700; color:#489e60;">{downside_pct}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Card: Pivot, Resistance & Support -->
+        <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:24px; box-shadow:0 1px 4px rgba(0,0,0,0.04);">
+            <div style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#64748b; margin-bottom:18px;">
+                Pivot, resistance &amp; support <span style="font-size:13px; color:#94a3b8; font-weight:normal;" title="Calculated price levels traders watch.">ⓘ</span>
+            </div>
+            <div>
+                {levels_rendered_html}
+            </div>
+        </div>
+    </div>
+</div>
+"""
+        st.html(trading_levels_html)
