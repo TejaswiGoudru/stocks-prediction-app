@@ -4,9 +4,15 @@ import streamlit as st
 from utils import (
     COMMON_CSS,
     add_portfolio_position,
+    clear_mongo_config,
     delete_portfolio_position,
     fetch_current_quote,
+    get_mongo_config,
     load_portfolio,
+    mask_mongo_uri,
+    migrate_json_to_mongo,
+    save_mongo_config,
+    test_mongo_connection,
     update_portfolio_position,
 )
 
@@ -14,6 +20,92 @@ st.html(COMMON_CSS)
 
 st.title("Stock Portfolio & Holdings")
 st.markdown("Save and track your stock holdings along with your active **Covered Call (CC)** and **Cash Secured Put (CSP)** options positions. Specify how many options are present, the purchase/open date, expiry date, strike price, and premium collected.")
+
+# ---------------------------------------------------------
+# MONGODB CONNECTION & CACHE MANAGEMENT
+# ---------------------------------------------------------
+mongo_cfg = get_mongo_config()
+
+if not mongo_cfg:
+    st.html("""
+    <div style="background: linear-gradient(135deg, #f0fdf4 0%, #eff6ff 100%); border: 1px solid #bbf7d0; border-radius: 12px; padding: 18px 22px; margin-top: 14px; margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.04);">
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span style="font-size:28px;">🍃</span>
+            <div>
+                <h4 style="margin:0; font-size:18px; font-weight:700; color:#14532d;">Connect Remote MongoDB (First-Time Setup)</h4>
+                <div style="font-size:13px; color:#166534; margin-top:4px; line-height:1.4;">
+                    Your portfolio positions are stored on a remote MongoDB server. Enter your connection string below to connect.
+                    <br><b>Security notice:</b> The connection string is cached in a private local file excluded by <code>.gitignore</code> and <b>will never be committed to the code repository</b>.
+                </div>
+            </div>
+        </div>
+    </div>
+    """)
+    with st.expander("🔑 Setup Remote MongoDB Connection String", expanded=True):
+        with st.form("mongo_setup_form"):
+            uri_input = st.text_input(
+                "MongoDB Connection String",
+                type="password",
+                placeholder="mongodb+srv://<username>:<password>@cluster0.mongodb.net/?retryWrites=true&w=majority",
+                help="Enter standard MongoDB URI or MongoDB Atlas SRV URI with user credentials.",
+            )
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                db_input = st.text_input("Database Name", value="stock_portfolio")
+            with col_m2:
+                coll_input = st.text_input("Collection Name", value="portfolio_holdings")
+
+            connect_btn = st.form_submit_button("🚀 Test, Connect & Cache Connection", type="primary")
+
+            if connect_btn:
+                if not uri_input:
+                    st.error("Please enter a valid MongoDB connection string.")
+                else:
+                    with st.spinner("Testing connection to remote MongoDB..."):
+                        ok, msg = test_mongo_connection(uri_input, db_input, coll_input)
+                    if ok:
+                        save_mongo_config(uri_input, db_input, coll_input)
+                        m_ok, m_msg = migrate_json_to_mongo()
+                        st.success(f"{msg} {m_msg if m_ok else ''}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+                        st.info("💡 **Tips**:\n- In MongoDB Atlas, go to **Network Access** and verify that your IP is whitelisted (or `0.0.0.0/0` is allowed).\n- Check your username and password.\n- If your password contains special characters, make sure they are URL percent-encoded.")
+else:
+    masked_uri = mask_mongo_uri(mongo_cfg.get("uri", ""))
+    db_name = mongo_cfg.get("db_name", "stock_portfolio")
+    coll_name = mongo_cfg.get("collection_name", "portfolio_holdings")
+    st.html(f"""
+    <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:10px 18px; margin-top:14px; margin-bottom:18px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:16px;">🟢</span>
+            <span style="color:#14532d; font-weight:700; font-size:14px;">Remote MongoDB Connected</span>
+            <span style="color:#15803d; font-size:13px;">&bull; <b>DB:</b> <code>{db_name}</code> &bull; <b>Collection:</b> <code>{coll_name}</code> &bull; <b>URI:</b> <code>{masked_uri}</code></span>
+        </div>
+    </div>
+    """)
+    with st.expander("⚙️ MongoDB Connection & Synchronization Settings"):
+        col_st1, col_st2, col_st3 = st.columns(3)
+        with col_st1:
+            if st.button("Ping Connection", key="mongo_ping_btn"):
+                ok, msg = test_mongo_connection(mongo_cfg.get("uri", ""), db_name, coll_name)
+                if ok:
+                    st.success(f"● {msg}")
+                else:
+                    st.error(f"● {msg}")
+        with col_st2:
+            if st.button("Re-sync Local JSON to MongoDB", key="mongo_sync_btn", help="Upload local portfolio.json positions to remote MongoDB"):
+                ok, msg = migrate_json_to_mongo()
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        with col_st3:
+            if st.button("Disconnect / Reconfigure", key="mongo_disconnect_btn", type="secondary"):
+                clear_mongo_config()
+                st.warning("MongoDB disconnected from cache. Re-enter your connection string to reconnect.")
+                st.rerun()
 
 # Sync ticker with session_state across pages
 if "ticker" not in st.session_state:

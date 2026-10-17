@@ -10,6 +10,14 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import yfinance as yf
 
+try:
+    import pymongo
+    from pymongo import MongoClient
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    PYMONGO_AVAILABLE = True
+except ImportError:
+    PYMONGO_AVAILABLE = False
+
 COMMON_CSS = """
 <style>
     .stApp {
@@ -334,13 +342,226 @@ def fetch_walletinvestor_data(
 
 
 # ---------------------------------------------------------
-# PORTFOLIO PERSISTENCE & MANAGEMENT
+# MONGODB CONFIGURATION, CACHING & PERSISTENCE
 # ---------------------------------------------------------
+MONGO_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".mongo_cache.json")
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
 
 
+def get_mongo_config():
+    """
+    Retrieves MongoDB configuration from session state, local cache, secrets, or env.
+    Returns: dict with {"uri", "db_name", "collection_name"} or None
+    """
+    # 1. Session state
+    if "mongo_config" in st.session_state and st.session_state.mongo_config:
+        return st.session_state.mongo_config
+
+    # 2. Local gitignored cache
+    if os.path.exists(MONGO_CACHE_FILE):
+        try:
+            with open(MONGO_CACHE_FILE, "r") as f:
+                cfg = json.load(f)
+                if isinstance(cfg, dict) and cfg.get("uri"):
+                    st.session_state.mongo_config = cfg
+                    return cfg
+        except Exception:
+            pass
+
+    # 3. Streamlit secrets (for Community Cloud)
+    try:
+        if "MONGODB_URI" in st.secrets:
+            cfg = {
+                "uri": st.secrets["MONGODB_URI"],
+                "db_name": st.secrets.get("MONGODB_DB", "stock_portfolio"),
+                "collection_name": st.secrets.get("MONGODB_COLLECTION", "portfolio_holdings"),
+            }
+            st.session_state.mongo_config = cfg
+            return cfg
+        elif "mongo" in st.secrets and "uri" in st.secrets["mongo"]:
+            cfg = {
+                "uri": st.secrets["mongo"]["uri"],
+                "db_name": st.secrets["mongo"].get("db", "stock_portfolio"),
+                "collection_name": st.secrets["mongo"].get("collection", "portfolio_holdings"),
+            }
+            st.session_state.mongo_config = cfg
+            return cfg
+    except Exception:
+        pass
+
+    # 4. Environment variable
+    if "MONGODB_URI" in os.environ:
+        cfg = {
+            "uri": os.environ["MONGODB_URI"],
+            "db_name": os.environ.get("MONGODB_DB", "stock_portfolio"),
+            "collection_name": os.environ.get("MONGODB_COLLECTION", "portfolio_holdings"),
+        }
+        st.session_state.mongo_config = cfg
+        return cfg
+
+    return None
+
+
+def save_mongo_config(uri: str, db_name: str = "stock_portfolio", collection_name: str = "portfolio_holdings"):
+    """Saves MongoDB config to local gitignored cache and active session."""
+    clean_uri = uri.strip()
+    clean_db = (db_name or "stock_portfolio").strip()
+    clean_coll = (collection_name or "portfolio_holdings").strip()
+    cfg = {
+        "uri": clean_uri,
+        "db_name": clean_db,
+        "collection_name": clean_coll,
+        "saved_at": datetime.now().isoformat(),
+    }
+    try:
+        with open(MONGO_CACHE_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        try:
+            os.chmod(MONGO_CACHE_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    st.session_state.mongo_config = cfg
+    st.cache_resource.clear()
+    return cfg
+
+
+def clear_mongo_config():
+    """Clears MongoDB config from cache and active session."""
+    if os.path.exists(MONGO_CACHE_FILE):
+        try:
+            os.remove(MONGO_CACHE_FILE)
+        except Exception:
+            pass
+    if "mongo_config" in st.session_state:
+        del st.session_state["mongo_config"]
+    st.cache_resource.clear()
+
+
+def mask_mongo_uri(uri: str) -> str:
+    """Masks credentials in MongoDB URI for safe UI display."""
+    if not uri:
+        return ""
+    return re.sub(r":([^/@]+)@", ":****@", uri)
+
+
+def test_mongo_connection(uri: str, db_name: str = "stock_portfolio", collection_name: str = "portfolio_holdings"):
+    """Tests connection to remote MongoDB. Returns (success: bool, message: str)."""
+    if not PYMONGO_AVAILABLE:
+        return False, "pymongo library is not installed."
+    clean_uri = uri.strip() if uri else ""
+    if not clean_uri or not (clean_uri.startswith("mongodb://") or clean_uri.startswith("mongodb+srv://")):
+        return False, "Invalid URI scheme. Must start with 'mongodb://' or 'mongodb+srv://'."
+    try:
+        client = MongoClient(clean_uri, serverSelectionTimeoutMS=4000, connectTimeoutMS=4000)
+        client.admin.command("ping")
+        db = client[(db_name or "stock_portfolio").strip()]
+        coll = db[(collection_name or "portfolio_holdings").strip()]
+        _ = coll.estimated_document_count()
+        client.close()
+        return True, f"Successfully connected to MongoDB (Database: {db_name}, Collection: {collection_name})!"
+    except Exception as e:
+        err_str = str(e)
+        if "bad auth" in err_str.lower() or "authentication failed" in err_str.lower():
+            return False, "Authentication failed. Please verify your MongoDB username and password."
+        if "timed out" in err_str.lower() or "serverselectiontimeouterror" in err_str.lower():
+            return False, "Connection timed out. Check network connectivity or MongoDB Atlas IP Access List (ensure 0.0.0.0/0 is allowed)."
+        return False, f"Connection failed: {err_str}"
+
+
+@st.cache_resource(show_spinner=False)
+def _get_cached_mongo_client(uri: str):
+    """Cached MongoClient instance per URI."""
+    if not PYMONGO_AVAILABLE:
+        return None
+    try:
+        client = MongoClient(
+            uri,
+            maxPoolSize=10,
+            serverSelectionTimeoutMS=3000,
+            connectTimeoutMS=3000,
+            socketTimeoutMS=5000,
+        )
+        # Verify liveness
+        client.admin.command("ping")
+        return client
+    except Exception:
+        return None
+
+
+def get_mongo_collection():
+    """Returns active pymongo Collection if configured and reachable, else None."""
+    cfg = get_mongo_config()
+    if not cfg or not cfg.get("uri"):
+        return None
+    client = _get_cached_mongo_client(cfg["uri"])
+    if client is None:
+        return None
+    try:
+        db = client[cfg.get("db_name", "stock_portfolio")]
+        coll = db[cfg.get("collection_name", "portfolio_holdings")]
+        return coll
+    except Exception:
+        return None
+
+
+def migrate_json_to_mongo():
+    """Migrates existing positions from portfolio.json into remote MongoDB collection."""
+    coll = get_mongo_collection()
+    if coll is None:
+        return False, "MongoDB is not connected."
+    if not os.path.exists(PORTFOLIO_FILE):
+        return False, "No local portfolio.json found to migrate."
+    try:
+        with open(PORTFOLIO_FILE, "r") as f:
+            positions = json.load(f)
+        if not isinstance(positions, list) or not positions:
+            return False, "portfolio.json contains no records."
+        migrated_count = 0
+        for p in positions:
+            clean_p = {k: v for k, v in p.items() if k != "_id"}
+            coll.replace_one({"id": clean_p["id"]}, clean_p, upsert=True)
+            migrated_count += 1
+        return True, f"Successfully migrated {migrated_count} position(s) from portfolio.json to MongoDB!"
+    except Exception as e:
+        return False, f"Migration failed: {str(e)}"
+
+
 def load_portfolio():
-    """Loads saved portfolio holdings from local JSON file."""
+    """Loads saved portfolio holdings from remote MongoDB, with local JSON fallback."""
+    coll = get_mongo_collection()
+    if coll is not None:
+        try:
+            docs = list(coll.find({}, {"_id": 0}))
+            if docs:
+                # Keep local JSON in sync as offline backup
+                try:
+                    with open(PORTFOLIO_FILE, "w") as f:
+                        json.dump(docs, f, indent=2)
+                except Exception:
+                    pass
+                return docs
+            else:
+                # Remote collection is empty. Check if local portfolio.json has existing records to auto-seed/migrate
+                if os.path.exists(PORTFOLIO_FILE):
+                    try:
+                        with open(PORTFOLIO_FILE, "r") as f:
+                            local_docs = json.load(f)
+                        if isinstance(local_docs, list) and local_docs:
+                            for p in local_docs:
+                                clean_p = {k: v for k, v in p.items() if k != "_id"}
+                                coll.replace_one({"id": clean_p["id"]}, clean_p, upsert=True)
+                            return local_docs
+                    except Exception:
+                        pass
+                return []
+        except Exception:
+            # Fall through to local file if MongoDB query times out
+            pass
+
+    # Fallback to local portfolio.json
     if not os.path.exists(PORTFOLIO_FILE):
         default_data = [
             {
@@ -350,6 +571,8 @@ def load_portfolio():
                 "cost_basis": 160.00,
                 "purchase_date": "2026-08-15",
                 "notes": "Core tech position for covered calls",
+                "covered_call": {"active": False},
+                "cash_secured_put": {"active": False},
             }
         ]
         save_portfolio(default_data)
@@ -366,10 +589,28 @@ def load_portfolio():
 
 
 def save_portfolio(positions):
-    """Saves portfolio holdings list to local JSON file."""
+    """Saves portfolio holdings list to remote MongoDB and local backup JSON."""
+    # 1. Remote MongoDB
+    coll = get_mongo_collection()
+    if coll is not None:
+        try:
+            active_ids = []
+            for p in positions:
+                clean_p = {k: v for k, v in p.items() if k != "_id"}
+                coll.replace_one({"id": clean_p["id"]}, clean_p, upsert=True)
+                active_ids.append(clean_p["id"])
+            if active_ids:
+                coll.delete_many({"id": {"$nin": active_ids}})
+            else:
+                coll.delete_many({})
+        except Exception:
+            pass
+
+    # 2. Local JSON backup
     try:
+        clean_list = [{k: v for k, v in p.items() if k != "_id"} for p in positions]
         with open(PORTFOLIO_FILE, "w") as f:
-            json.dump(positions, f, indent=2)
+            json.dump(clean_list, f, indent=2)
         return True
     except Exception:
         return False
@@ -385,7 +626,6 @@ def add_portfolio_position(
     cash_secured_put: dict = None,
 ):
     """Adds a new stock position with optional active covered call & cash secured put positions."""
-    positions = load_portfolio()
     new_pos = {
         "id": f"pos_{uuid.uuid4().hex[:8]}",
         "ticker": ticker.strip().upper(),
@@ -396,35 +636,74 @@ def add_portfolio_position(
         "covered_call": covered_call or {"active": False},
         "cash_secured_put": cash_secured_put or {"active": False},
     }
-    positions.append(new_pos)
-    save_portfolio(positions)
+
+    # Remote MongoDB insert
+    coll = get_mongo_collection()
+    if coll is not None:
+        try:
+            coll.insert_one(new_pos.copy())
+        except Exception:
+            pass
+
+    # Local backup update
+    positions = load_portfolio()
+    if not any(p.get("id") == new_pos["id"] for p in positions):
+        positions.append(new_pos)
+    try:
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+    except Exception:
+        pass
+
     return new_pos
 
 
 def update_portfolio_position(pos_id: str, updated_data: dict):
-    """Updates an existing portfolio position by ID."""
+    """Updates an existing portfolio position by ID in remote MongoDB and local backup."""
+    coll = get_mongo_collection()
+    if coll is not None:
+        try:
+            clean_update = {k: v for k, v in updated_data.items() if k != "_id"}
+            coll.update_one({"id": pos_id}, {"$set": clean_update})
+        except Exception:
+            pass
+
     positions = load_portfolio()
     for i, p in enumerate(positions):
         if p.get("id") == pos_id:
             positions[i].update(updated_data)
             break
-    save_portfolio(positions)
+    try:
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+    except Exception:
+        pass
     return True
 
 
 def save_or_update_option_position(ticker: str, option_type: str, option_data: dict):
-    """Saves or updates active covered_call or cash_secured_put for a ticker."""
+    """Saves or updates active covered_call or cash_secured_put for a ticker in MongoDB and local backup."""
     positions = load_portfolio()
     found = False
+    target_ticker = ticker.strip().upper()
+    coll = get_mongo_collection()
+
     for i, p in enumerate(positions):
-        if p.get("ticker", "").upper() == ticker.strip().upper():
+        if p.get("ticker", "").upper() == target_ticker:
             positions[i][option_type] = option_data
             found = True
+            target_id = p.get("id")
+            if coll is not None:
+                try:
+                    coll.update_one({"id": target_id}, {"$set": {option_type: option_data}})
+                except Exception:
+                    pass
             break
+
     if not found:
         new_pos = {
             "id": f"pos_{uuid.uuid4().hex[:8]}",
-            "ticker": ticker.strip().upper(),
+            "ticker": target_ticker,
             "shares": option_data.get("contracts", 1) * 100,
             "cost_basis": float(option_data.get("strike", 100.0)),
             "purchase_date": option_data.get("open_date", str(datetime.now().date())),
@@ -432,17 +711,41 @@ def save_or_update_option_position(ticker: str, option_type: str, option_data: d
             "covered_call": option_data if option_type == "covered_call" else {"active": False},
             "cash_secured_put": option_data if option_type == "cash_secured_put" else {"active": False},
         }
+        if coll is not None:
+            try:
+                coll.insert_one(new_pos.copy())
+            except Exception:
+                pass
         positions.append(new_pos)
-    save_portfolio(positions)
+
+    try:
+        clean_list = [{k: v for k, v in p.items() if k != "_id"} for p in positions]
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(clean_list, f, indent=2)
+    except Exception:
+        pass
+
     return True
 
 
 def delete_portfolio_position(pos_id: str):
-    """Deletes a stock position by ID."""
+    """Deletes a stock position by ID in remote MongoDB and local backup."""
+    coll = get_mongo_collection()
+    if coll is not None:
+        try:
+            coll.delete_one({"id": pos_id})
+        except Exception:
+            pass
+
     positions = load_portfolio()
     filtered = [p for p in positions if p.get("id") != pos_id]
-    save_portfolio(filtered)
+    try:
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(filtered, f, indent=2)
+    except Exception:
+        pass
     return True
+
 
 
 @st.cache_data(ttl=300, show_spinner=False)

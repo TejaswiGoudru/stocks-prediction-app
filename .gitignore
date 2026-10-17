@@ -2,5 +2,9 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+.mongo_cache.json
+.streamlit/secrets.toml
+*.secret
 .agents/skills/developing-with-streamlit
 .claude/skills/developing-with-streamlit
