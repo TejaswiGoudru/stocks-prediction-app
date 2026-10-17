@@ -430,14 +430,16 @@ else:
             strategy_label = "Stock Holding"
             subtitle_text = f"{shs:,} shares &bull; Bought @ <b>${cost:.2f}</b> on {p_date} {f'({days_str})' if days_str else ''}"
 
-        # HTML row for Covered Call Metrics
-        cc_metric_row = f"""
+        # HTML row for Covered Call Metrics (only if active)
+        cc_metric_row = ""
+        if has_cc:
+            cc_metric_row = f"""
         <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
             <div style="display:flex; align-items:center; gap:8px; min-width:160px;">
                 <span style="font-size:16px;">🪙</span>
                 <div>
                     <div style="font-size:12px; font-weight:700; color:#0369a1; text-transform:uppercase; letter-spacing:0.03em;">Covered Call</div>
-                    <div style="font-size:11px; color:#64748b;">{'Active CC Option' if has_cc else ('Stock Position' if not is_pure_csp else 'Awaiting Assignment')}</div>
+                    <div style="font-size:11px; color:#64748b;">Active CC Option &bull; {shs:,} shs</div>
                 </div>
             </div>
             <div style="display:flex; gap:22px; align-items:center; flex-wrap:wrap;">
@@ -447,34 +449,36 @@ else:
                 </div>
                 <div style="text-align:right;">
                     <div style="font-size:11px; color:#64748b; font-weight:600;">Market Value</div>
-                    <div style="font-size:16px; font-weight:700; color:#1e293b;">{f'${pos_val:,.2f}' if not is_pure_csp else '—'}</div>
+                    <div style="font-size:16px; font-weight:700; color:#1e293b;">${pos_val:,.2f}</div>
                 </div>
                 <div style="text-align:right;">
                     <div style="font-size:11px; color:#64748b; font-weight:600;">Unrealized P&amp;L</div>
-                    <div style="font-size:16px; font-weight:800; color:{pos_color};">{f'{pos_pnl_pct:+.2f}% (${pos_pnl:+,.2f})' if not is_pure_csp else '—'}</div>
+                    <div style="font-size:16px; font-weight:800; color:{pos_color};">{pos_pnl_pct:+.2f}% (${pos_pnl:+,.2f})</div>
                 </div>
                 <div style="text-align:right; min-width:90px;">
                     <div style="font-size:11px; color:#00875A; font-weight:600;">CC Ready</div>
-                    <div style="font-size:16px; font-weight:800; color:#00875A;">{f'{cc_cnt_val} contract(s)' if not is_pure_csp else '0 (if assigned)'}</div>
+                    <div style="font-size:16px; font-weight:800; color:#00875A;">{cc_cnt_val} contract(s) Active</div>
                 </div>
             </div>
         </div>
         """
 
-        # HTML row for Cash Secured Put Metrics
-        csp_metric_row = f"""
+        # HTML row for Cash Secured Put Metrics (only if active)
+        csp_metric_row = ""
+        if has_csp:
+            csp_metric_row = f"""
         <div style="background:#fefce8; border:1px solid #fef08a; border-radius:8px; padding:10px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
             <div style="display:flex; align-items:center; gap:8px; min-width:160px;">
                 <span style="font-size:16px;">💰</span>
                 <div>
                     <div style="font-size:12px; font-weight:700; color:#854d0e; text-transform:uppercase; letter-spacing:0.03em;">Cash Secured Put</div>
-                    <div style="font-size:11px; color:#a16207;">{'Active Put Option' if has_csp else 'Ready to Sell'}</div>
+                    <div style="font-size:11px; color:#a16207;">Active Put Option &bull; Strike ${csp_strike_val:.2f}</div>
                 </div>
             </div>
             <div style="display:flex; gap:22px; align-items:center; flex-wrap:wrap;">
                 <div style="text-align:right;">
                     <div style="font-size:11px; color:#64748b; font-weight:600;">Spot Price</div>
-                    <div style="font-size:16px; font-weight:700; color:#1e293b;">${cur_p:.2f} {f'<span style="font-size:11px; font-weight:700; color:{csp_otm_color};">({csp_otm_str})</span>' if has_csp else ''}</div>
+                    <div style="font-size:16px; font-weight:700; color:#1e293b;">${cur_p:.2f} <span style="font-size:11px; font-weight:700; color:{csp_otm_color};">({csp_otm_str})</span></div>
                 </div>
                 <div style="text-align:right;">
                     <div style="font-size:11px; color:#64748b; font-weight:600;">Market Value</div>
@@ -482,21 +486,39 @@ else:
                 </div>
                 <div style="text-align:right;">
                     <div style="font-size:11px; color:#64748b; font-weight:600;">Unrealized P&amp;L</div>
-                    <div style="font-size:16px; font-weight:800; color:{csp_pnl_color};">{f'{csp_pnl_pct:+.2f}% (${csp_pnl:+,.2f})' if has_csp else '—'}</div>
+                    <div style="font-size:16px; font-weight:800; color:{csp_pnl_color};">{csp_pnl_pct:+.2f}% (${csp_pnl:+,.2f})</div>
                 </div>
                 <div style="text-align:right; min-width:90px;">
                     <div style="font-size:11px; color:#b45309; font-weight:600;">CSP Ready</div>
-                    <div style="font-size:16px; font-weight:800; color:#b45309;">{csp_cnt_val} contract(s){' Active' if has_csp else ' Ready'}</div>
+                    <div style="font-size:16px; font-weight:800; color:#b45309;">{csp_cnt_val} contract(s) Active</div>
                 </div>
             </div>
         </div>
         """
 
-        # Order rows: if pure CSP, show CSP first; otherwise show CC first
+        # Assemble rows only for active options
+        metric_rows = []
         if is_pure_csp:
-            metrics_html = f'<div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">{csp_metric_row}{cc_metric_row}</div>'
+            if csp_metric_row: metric_rows.append(csp_metric_row)
+            if cc_metric_row: metric_rows.append(cc_metric_row)
         else:
-            metrics_html = f'<div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">{cc_metric_row}{csp_metric_row}</div>'
+            if cc_metric_row: metric_rows.append(cc_metric_row)
+            if csp_metric_row: metric_rows.append(csp_metric_row)
+
+        if metric_rows:
+            metrics_html = f'<div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">{"".join(metric_rows)}</div>'
+        else:
+            metrics_html = f"""
+            <div style="background:#f8fafc; border:1px dashed #cbd5e1; border-radius:8px; padding:12px 18px; margin-top:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                <div style="display:flex; align-items:center; gap:8px; color:#64748b; font-size:13px;">
+                    <span>ℹ️</span> <span>No active <b>Covered Call</b> or <b>Cash Secured Put</b> options recorded for {t}.</span>
+                </div>
+                <div style="font-size:12px; color:#475569;">
+                    Use the buttons below to analyze and open active options positions.
+                </div>
+            </div>
+            """
+
 
         with st.container():
             st.html(f"""
