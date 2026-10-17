@@ -159,7 +159,7 @@ if ticker_input:
     brand_data = get_stock_branding_and_ratings(data["ticker"])
     st.html(render_ticker_brand_badge(data["ticker"], cur_p=current_p, brand_data=brand_data))
 
-    with st.expander("📊 Wall Street Analyst Rating & Technical Intelligence", expanded=True):
+    with st.expander("📊 Wall Street Analyst Rating & Technical Intelligence", expanded=False):
         render_analyst_ratings_dashboard(data["ticker"], brand_data=brand_data)
 
     # ---------------------------------------------------------
